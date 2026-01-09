@@ -91,6 +91,100 @@ class VLJEPAModel(nn.Module):
                     if layer.bias is not None:
                         nn.init.constant_(layer.bias, 0)
     
+    def freeze_text_encoder(self):
+        """
+        Freeze the ENTIRE text encoder for Stage-2 training.
+        This includes all layers, LayerNorms, embeddings - everything in DistilBERT.
+        
+        IMPORTANT: This does NOT freeze projection heads (vision_projection, text_projection).
+        Projection heads remain trainable in Stage-2.
+        """
+        # Freeze ALL parameters in text encoder (including LayerNorms, embeddings, etc.)
+        frozen_count = 0
+        for name, param in self.text_encoder.named_parameters():
+            param.requires_grad = False
+            frozen_count += 1
+        
+        # Also freeze target text encoder (should already be frozen, but ensure it)
+        for param in self.target_text_encoder.parameters():
+            param.requires_grad = False
+        
+        # VERIFY: Projection heads should still be trainable
+        vision_proj_trainable = all(p.requires_grad for p in self.vision_projection.parameters())
+        text_proj_trainable = all(p.requires_grad for p in self.text_projection.parameters())
+        
+        if not vision_proj_trainable or not text_proj_trainable:
+            raise RuntimeError("ERROR: Projection heads were accidentally frozen!")
+        
+        # Count frozen vs trainable parameters
+        frozen_params = sum(p.numel() for p in self.text_encoder.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        
+        return {
+            'frozen_text_params': frozen_params,
+            'frozen_layer_count': frozen_count,
+            'trainable_params': trainable_params,
+            'vision_proj_trainable': vision_proj_trainable,
+            'text_proj_trainable': text_proj_trainable,
+        }
+    
+    def unfreeze_text_encoder(self):
+        """Unfreeze the text encoder (for Stage-1 or fine-tuning)."""
+        for param in self.text_encoder.parameters():
+            param.requires_grad = True
+    
+    def get_trainable_parameters(self):
+        """
+        Get only trainable parameters for optimizer.
+        Use this in Stage-2 to avoid passing frozen params to optimizer.
+        """
+        return [p for p in self.parameters() if p.requires_grad]
+    
+    def get_parameter_groups(self, base_lr: float, stage2: bool = False):
+        """
+        Get parameter groups with different learning rates.
+        
+        Args:
+            base_lr: Base learning rate
+            stage2: If True, text encoder is frozen and excluded
+            
+        Returns:
+            List of parameter groups for optimizer
+        """
+        if stage2:
+            # Stage-2: Only vision encoder, predictor, and projection heads
+            return [
+                {'params': list(self.vision_encoder.parameters()), 'lr': base_lr},
+                {'params': list(self.predictor.parameters()), 'lr': base_lr},
+                {'params': list(self.vision_projection.parameters()), 'lr': base_lr},
+                {'params': list(self.text_projection.parameters()), 'lr': base_lr},
+            ]
+        else:
+            # Stage-1: All parameters
+            return [
+                {'params': list(self.vision_encoder.parameters()), 'lr': base_lr},
+                {'params': list(self.text_encoder.parameters()), 'lr': base_lr},
+                {'params': list(self.predictor.parameters()), 'lr': base_lr},
+                {'params': list(self.vision_projection.parameters()), 'lr': base_lr},
+                {'params': list(self.text_projection.parameters()), 'lr': base_lr},
+            ]
+    
+    def verify_frozen_text_encoder(self):
+        """
+        Verify that text encoder is properly frozen.
+        Returns True if all text encoder params have requires_grad=False.
+        """
+        text_params = list(self.text_encoder.parameters())
+        frozen_count = sum(1 for p in text_params if not p.requires_grad)
+        total_count = len(text_params)
+        
+        all_frozen = frozen_count == total_count
+        return {
+            'all_frozen': all_frozen,
+            'frozen_count': frozen_count,
+            'total_count': total_count,
+        }
+
     @torch.no_grad()
     def update_target_encoder(self):
         """

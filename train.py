@@ -46,11 +46,22 @@ def parse_args():
     parser.add_argument("--eval_only", action="store_true", help="Only run evaluation")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
     parser.add_argument("--wandb", action="store_true", help="Use Weights & Biases logging")
+    parser.add_argument("--stage2", action="store_true", help="Stage-2 training: freeze text encoder, lower LR")
+    parser.add_argument("--stage2_lr_factor", type=float, default=0.5, help="LR multiplier for Stage-2 (default: 0.5)")
+    parser.add_argument("--stage2_epochs", type=int, default=4, choices=[1, 2, 3, 4], help="Number of epochs for Stage-2 (max: 4)")
+    parser.add_argument("--early_stop_patience", type=int, default=2, help="Early stopping patience based on mean recall")
     return parser.parse_args()
 
 
-def create_optimizer(model: nn.Module, config: Dict) -> torch.optim.Optimizer:
-    """Create optimizer from config"""
+def create_optimizer(model: nn.Module, config: Dict, stage2: bool = False, stage2_lr_factor: float = 0.5) -> torch.optim.Optimizer:
+    """Create optimizer from config
+    
+    Args:
+        model: The VL-JEPA model
+        config: Configuration dictionary
+        stage2: If True, use Stage-2 settings (frozen text encoder, lower LR)
+        stage2_lr_factor: Learning rate multiplier for Stage-2
+    """
     opt_config = config['training']['optimizer']
     opt_type = opt_config.get('type', 'adamw')
     lr = config['training']['learning_rate']
@@ -58,9 +69,21 @@ def create_optimizer(model: nn.Module, config: Dict) -> torch.optim.Optimizer:
     betas = tuple(opt_config.get('betas', [0.9, 0.999]))
     eps = opt_config.get('eps', 1e-8)
     
+    # Stage-2: Use reduced learning rate
+    if stage2:
+        lr = lr * stage2_lr_factor
+        print(f"Stage-2: Using reduced LR = {lr:.2e} (factor: {stage2_lr_factor})")
+    
+    # Get parameter groups (excludes frozen text encoder in Stage-2)
+    if hasattr(model, 'get_parameter_groups'):
+        param_groups = model.get_parameter_groups(lr, stage2=stage2)
+    else:
+        # Fallback: only trainable parameters
+        param_groups = [p for p in model.parameters() if p.requires_grad]
+    
     if opt_type == 'adamw8bit' and HAS_BITSANDBYTES:
         optimizer = bnb.optim.AdamW8bit(
-            model.parameters(),
+            param_groups,
             lr=lr,
             betas=betas,
             eps=eps,
@@ -69,7 +92,7 @@ def create_optimizer(model: nn.Module, config: Dict) -> torch.optim.Optimizer:
         print("Using 8-bit AdamW optimizer")
     else:
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            param_groups,
             lr=lr,
             betas=betas,
             eps=eps,
@@ -120,9 +143,16 @@ def train_one_epoch(
     logger,
     global_step: int,
     warmup_steps: int,
+    stage2: bool = False,
 ) -> tuple:
     """Train for one epoch"""
     model.train()
+    
+    # Stage-2 safety check: verify text encoder is still frozen
+    if stage2:
+        verify_info = model.verify_frozen_text_encoder()
+        if not verify_info['all_frozen']:
+            raise RuntimeError(f"Stage-2 ERROR: Text encoder unfrozen! {verify_info}")
     
     loss_meter = AverageMeter()
     jepa_loss_meter = AverageMeter()
@@ -139,7 +169,7 @@ def train_one_epoch(
     ema_start = config['training'].get('ema_momentum_start', 0.996)
     ema_end = config['training'].get('ema_momentum_end', 1.0)
     
-    # Loss weights
+    # Loss weights - LOCKED, do not change during training
     jepa_loss_weight = config['training'].get('jepa_loss_weight', 1.0)
     contrastive_loss_weight = config['training'].get('contrastive_loss_weight', 0.5)
     
@@ -351,6 +381,28 @@ def main():
     model = create_vl_jepa_model(config)
     model = model.to(device)
     
+    # Stage-2: Freeze text encoder
+    if args.stage2:
+        logger.info("=" * 50)
+        logger.info("STAGE-2 TRAINING MODE")
+        logger.info("=" * 50)
+        freeze_info = model.freeze_text_encoder()
+        logger.info(f"Frozen text encoder parameters: {freeze_info['frozen_text_params'] / 1e6:.2f}M")
+        logger.info(f"Trainable parameters: {freeze_info['trainable_params'] / 1e6:.2f}M")
+        logger.info("Text encoder weights are FROZEN - no gradients will flow through DistilBERT")
+        logger.info(f"Stage-2 epochs: {args.stage2_epochs}")
+        logger.info(f"Stage-2 LR factor: {args.stage2_lr_factor}")
+        logger.info(f"Early stopping patience: {args.early_stop_patience} (based on mean_recall)")
+        
+        # Verify freeze was successful
+        verify_info = model.verify_frozen_text_encoder()
+        if verify_info['all_frozen']:
+            logger.info(f"✓ Verified: All {verify_info['total_count']} text encoder parameters are frozen")
+        else:
+            logger.error(f"✗ ERROR: Only {verify_info['frozen_count']}/{verify_info['total_count']} text params frozen!")
+            raise RuntimeError("Text encoder freeze verification failed!")
+        logger.info("=" * 50)
+    
     num_params = sum(p.numel() for p in model.parameters())
     num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Total parameters: {num_params / 1e6:.2f}M")
@@ -416,8 +468,8 @@ def main():
     # Create mask generator
     mask_generator = create_mask_generator(config['data'])
     
-    # Create optimizer and scheduler
-    optimizer = create_optimizer(model, config)
+    # Create optimizer and scheduler (with Stage-2 settings if applicable)
+    optimizer = create_optimizer(model, config, stage2=args.stage2, stage2_lr_factor=args.stage2_lr_factor)
     scheduler, warmup_steps = create_scheduler(optimizer, config, len(train_loader))
     
     # Create gradient scaler for mixed precision
@@ -426,28 +478,43 @@ def main():
     # Load checkpoint if resuming
     start_epoch = 0
     global_step = 0
-    best_metric = float('inf')
+    best_metric = float('inf') if not args.stage2 else 0.0  # Stage-2 uses mean_recall (higher is better)
+    best_mean_recall = 0.0  # Track best mean recall for Stage-2
     
     if args.resume:
         checkpoint_info = load_checkpoint(
             args.resume,
             model,
-            optimizer,
-            scheduler,
+            optimizer=None if args.stage2 else optimizer,  # Don't load optimizer state for Stage-2
+            scheduler=None if args.stage2 else scheduler,  # Don't load scheduler state for Stage-2
             device=device,
         )
-        start_epoch = checkpoint_info['epoch'] + 1
-        global_step = checkpoint_info['global_step']
-        best_metric = checkpoint_info['best_metric']
-        logger.info(f"Resumed from epoch {start_epoch}")
+        if args.stage2:
+            # For Stage-2, start fresh epoch count but keep model weights
+            start_epoch = 0
+            global_step = 0
+            logger.info(f"Stage-2: Loaded model weights from checkpoint (epoch {checkpoint_info['epoch']})")
+            logger.info("Stage-2: Reset optimizer and scheduler for fine-tuning")
+        else:
+            start_epoch = checkpoint_info['epoch'] + 1
+            global_step = checkpoint_info['global_step']
+            best_metric = checkpoint_info['best_metric']
+            logger.info(f"Resumed from epoch {start_epoch}")
     
     # Training loop
-    num_epochs = config['training']['num_epochs']
+    num_epochs = args.stage2_epochs if args.stage2 else config['training']['num_epochs']
     checkpoint_dir = Path(config['training'].get('checkpoint_dir', 'checkpoints'))
     checkpoint_dir.mkdir(exist_ok=True)
     save_every = config['training'].get('save_every', 5)
     
+    # Early stopping for Stage-2
+    early_stop_patience = args.early_stop_patience
+    epochs_without_improvement = 0
+    
     logger.info("Starting training...")
+    if args.stage2:
+        logger.info(f"Stage-2: Training for {num_epochs} epochs with early stopping (patience={early_stop_patience})")
+        logger.info(f"Stage-2: Loss weights LOCKED at jepa={config['training'].get('jepa_loss_weight', 1.0)}, contrastive={config['training'].get('contrastive_loss_weight', 0.5)}")
     
     for epoch in range(start_epoch, num_epochs):
         # Train
@@ -462,11 +529,12 @@ def main():
             config=config,
             logger=logger,
             global_step=global_step,
-            warmup_steps=warmup_steps,
+            warmup_steps=warmup_steps if not args.stage2 else 0,  # No warmup for Stage-2
+            stage2=args.stage2,  # Pass stage2 flag for safety checks
         )
         
         # Validate (if val_loader exists)
-        val_metrics = {'val_loss': float('inf')}
+        val_metrics = {'val_loss': float('inf'), 'mean_recall': 0.0}
         if val_loader is not None:
             val_metrics = validate(
                 model=model,
@@ -476,25 +544,72 @@ def main():
                 logger=logger,
             )
         
-        # Save checkpoint
-        is_best = val_metrics['val_loss'] < best_metric
-        if is_best:
-            best_metric = val_metrics['val_loss']
+        # Determine if this is the best model
+        if args.stage2:
+            # Stage-2: Use mean_recall (higher is better)
+            current_mean_recall = val_metrics.get('mean_recall', 0.0)
+            is_best = current_mean_recall > best_mean_recall
+            if is_best:
+                best_mean_recall = current_mean_recall
+                epochs_without_improvement = 0
+                logger.info(f"Stage-2: New best mean_recall = {best_mean_recall:.2f}%")
+            else:
+                epochs_without_improvement += 1
+                logger.info(f"Stage-2: No improvement for {epochs_without_improvement} epoch(s)")
+            
+            # Early stopping check
+            if epochs_without_improvement >= early_stop_patience:
+                logger.info(f"Stage-2: Early stopping triggered (no improvement for {early_stop_patience} epochs)")
+                break
+        else:
+            # Stage-1: Use val_loss (lower is better)
+            is_best = val_metrics['val_loss'] < best_metric
+            if is_best:
+                best_metric = val_metrics['val_loss']
         
-        if (epoch + 1) % save_every == 0 or is_best:
+        # Save checkpoint
+        if args.stage2:
+            # Stage-2: Always save each epoch, mark best
             save_checkpoint(
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 epoch=epoch,
                 global_step=global_step,
-                best_metric=best_metric,
+                best_metric=best_mean_recall,
                 config=config,
-                save_path=checkpoint_dir / f"checkpoint_epoch_{epoch}.pth",
+                save_path=checkpoint_dir / f"stage2_epoch_{epoch}.pth",
                 is_best=is_best,
             )
+            if is_best:
+                save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    global_step=global_step,
+                    best_metric=best_mean_recall,
+                    config=config,
+                    save_path=checkpoint_dir / "stage2_best.pth",
+                    is_best=True,
+                )
+        else:
+            if (epoch + 1) % save_every == 0 or is_best:
+                save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    global_step=global_step,
+                    best_metric=best_metric,
+                    config=config,
+                    save_path=checkpoint_dir / f"checkpoint_epoch_{epoch}.pth",
+                    is_best=is_best,
+                )
     
     logger.info("Training completed!")
+    if args.stage2:
+        logger.info(f"Stage-2 Best Mean Recall: {best_mean_recall:.2f}%")
     
     if wandb.run is not None:
         wandb.finish()
