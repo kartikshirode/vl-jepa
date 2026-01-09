@@ -1,0 +1,37 @@
+# VL-JEPA Requirements for Jetson Orin Nano
+
+# Core Deep Learning (pre-installed with JetPack, but listed for reference)
+# torch>=2.0.0
+# torchvision>=0.15.0
+
+# Pre-trained Models
+transformers>=4.30.0
+timm>=0.9.0
+
+# Memory-Efficient Optimization
+bitsandbytes>=0.41.0  # 8-bit optimizers
+accelerate>=0.20.0
+
+# Data Processing
+pillow>=9.0.0
+opencv-python>=4.7.0
+einops>=0.6.1
+
+# Training Utilities
+wandb>=0.15.0
+tensorboard>=2.13.0
+tqdm>=4.65.0
+
+# General
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# Dataset
+pycocotools>=2.0.6
+
+# Visualization (optional)
+matplotlib>=3.7.0
+seaborn>=0.12.0

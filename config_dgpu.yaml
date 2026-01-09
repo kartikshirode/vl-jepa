@@ -1,0 +1,137 @@
+# VL-JEPA Configuration for Discrete GPU (DGPU)
+# Optimized for GPUs with 8GB+ VRAM (RTX 3070, 4070, etc.)
+
+model:
+  vision_encoder:
+    type: "vit_tiny_patch16_224"  # Can upgrade to vit_small for more capacity
+    pretrained: true  # Use ImageNet pretrained weights
+    hidden_dim: 192
+    num_layers: 12
+    num_heads: 3
+    patch_size: 16
+    image_size: 224
+    mlp_ratio: 4.0
+    dropout: 0.0
+    attention_dropout: 0.0
+    drop_path_rate: 0.1
+    qkv_bias: true
+    gradient_checkpointing: false  # Disable for DGPU (faster, more memory available)
+  
+  text_encoder:
+    type: "distilbert-base-uncased"
+    hidden_dim: 768
+    projection_dim: 384
+    max_length: 128
+    dropout: 0.1
+    gradient_checkpointing: false  # Disable for DGPU
+  
+  predictor:
+    type: "mlp"  # Options: "mlp", "transformer"
+    input_dim: 192  # Match vision encoder
+    hidden_dim: 384  # Larger hidden dim for DGPU
+    output_dim: 192
+    num_layers: 4   # Deeper predictor
+    dropout: 0.1
+    use_layer_norm: true
+  
+  embedding_dim: 256  # Shared embedding space for contrastive learning
+  temperature: 0.07  # For contrastive loss
+
+training:
+  # Batch configuration - DGPU can handle larger batches
+  batch_size: 16  # Per GPU (increase based on your VRAM)
+  gradient_accumulation_steps: 2  # Effective batch = 32
+  num_epochs: 100
+  
+  # Optimizer
+  learning_rate: 3.0e-4  # Slightly higher LR for larger batches
+  weight_decay: 0.05
+  warmup_epochs: 10
+  warmup_steps: null
+  min_lr: 1.0e-6
+  
+  optimizer:
+    type: "adamw"  # Standard AdamW (faster than 8-bit on DGPU)
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  
+  scheduler:
+    type: "cosine"
+    warmup_type: "linear"
+  
+  # Mixed precision
+  mixed_precision: "fp16"  # Use FP16 for speed
+  gradient_clip: 1.0
+  
+  # EMA for target encoder
+  ema_momentum_start: 0.996
+  ema_momentum_end: 1.0
+  
+  # Loss weights
+  jepa_loss_weight: 1.0
+  contrastive_loss_weight: 0.5
+  
+  # Memory management
+  empty_cache_every: 500  # Less frequent cache clearing
+  
+  # Checkpointing
+  save_every: 5
+  checkpoint_dir: "checkpoints"
+  resume_from: null
+
+data:
+  # Dataset - use 'dummy' for testing without data
+  dataset_name: "coco_captions"  # Options: coco_captions, flickr30k, dummy
+  data_root: "./vl_jepa/data/COCO2017"
+  train_split: "train"
+  val_split: "val"
+  max_samples: null  # Use full dataset (remove limit)
+  
+  # DataLoader - DGPU can handle more workers
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 4
+  persistent_workers: false
+  
+  # Image transforms
+  image_transforms:
+    resize: 256
+    random_resized_crop: 224
+    random_crop_scale: [0.2, 1.0]
+    random_crop_ratio: [0.75, 1.333]
+    random_horizontal_flip: 0.5
+    color_jitter:
+      brightness: 0.4
+      contrast: 0.4
+      saturation: 0.4
+      hue: 0.1
+      prob: 0.8
+    gaussian_blur_prob: 0.1
+    grayscale_prob: 0.2
+    normalize_mean: [0.485, 0.456, 0.406]
+    normalize_std: [0.229, 0.224, 0.225]
+
+masking:
+  # Multi-block masking strategy (following I-JEPA)
+  num_context_blocks: 1
+  num_target_blocks: 4
+  context_scale: [0.85, 1.0]  # Context covers 85-100% of image
+  target_scale: [0.15, 0.2]   # Each target block is 15-20%
+  context_aspect_ratio: [1.0, 1.0]  # Square context
+  target_aspect_ratio: [0.75, 1.5]  # Variable aspect ratio targets
+  allow_overlap: false
+  min_keep: 10
+
+logging:
+  log_every: 50
+  use_wandb: false  # Set to true for experiment tracking
+  wandb_project: "vl-jepa"
+  wandb_entity: null  # Your W&B username/team
+  save_images: true
+  save_images_every: 500
+
+# Evaluation settings
+evaluation:
+  eval_every: 1  # Evaluate every N epochs
+  retrieval_k: [1, 5, 10]
+  max_eval_samples: 5000

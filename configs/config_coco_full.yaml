@@ -1,0 +1,90 @@
+# VL-JEPA Full COCO Training Configuration for Jetson Orin Nano
+# Optimized for 8GB unified memory
+
+model:
+  vision_encoder:
+    type: vit_tiny_patch16_224
+    pretrained: true
+    hidden_dim: 192
+    gradient_checkpointing: false
+  
+  text_encoder:
+    type: distilbert-base-uncased
+    hidden_dim: 768
+    projection_dim: 384
+    max_length: 64
+    gradient_checkpointing: false
+  
+  predictor:
+    type: mlp
+    input_dim: 192
+    hidden_dim: 256
+    output_dim: 192
+    num_layers: 3
+  
+  embedding_dim: 256
+  temperature: 0.07
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 16  # Effective batch size = 16
+  num_epochs: 50
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+  
+  optimizer:
+    type: adamw
+    betas: [0.9, 0.999]
+  
+  scheduler:
+    type: cosine
+  
+  mixed_precision: fp16
+  gradient_clip: 1.0
+  
+  # EMA for target encoder
+  ema_momentum_start: 0.996
+  ema_momentum_end: 1.0
+  
+  # Loss weights
+  jepa_loss_weight: 1.0
+  contrastive_loss_weight: 0.1  # Enable contrastive learning
+  
+  # Memory management
+  empty_cache_every: 100
+  
+  # Checkpointing
+  save_every: 5
+  checkpoint_dir: checkpoints
+
+data:
+  dataset_name: coco_captions
+  data_root: ./data
+  train_split: train
+  val_split: val
+  # Remove max_samples to use full dataset
+  # max_samples: 1000
+  
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  
+  masking:
+    num_context_blocks: 1
+    context_scale: [0.85, 1.0]
+    num_target_blocks: 4
+    target_scale: [0.15, 0.2]
+
+logging:
+  log_every: 100
+  log_dir: logs
+  tensorboard_dir: runs
+  use_wandb: false
+  project_name: vl-jepa-coco
+
+validation:
+  val_every: 1  # Validate every epoch
+  metrics:
+    - loss
