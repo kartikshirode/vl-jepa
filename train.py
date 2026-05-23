@@ -83,52 +83,102 @@ def create_optimizer(model: nn.Module, config: Dict, stage2: bool = False, stage
     
     if opt_type == 'adamw8bit' and HAS_BITSANDBYTES:
         optimizer = bnb.optim.AdamW8bit(
-            param_groups,
-            lr=lr,
-            betas=betas,
-            eps=eps,
-            weight_decay=weight_decay,
+            param_groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
         )
         print("Using 8-bit AdamW optimizer")
     else:
+        if opt_type == 'adamw8bit' and not HAS_BITSANDBYTES:
+            import warnings
+            warnings.warn(
+                "Config requested optimizer.type='adamw8bit' but bitsandbytes "
+                "is not installed; falling back to torch.optim.AdamW (fp32). "
+                "Install bitsandbytes (`pip install bitsandbytes`) to honor "
+                "the config.",
+                RuntimeWarning,
+            )
         optimizer = torch.optim.AdamW(
-            param_groups,
-            lr=lr,
-            betas=betas,
-            eps=eps,
-            weight_decay=weight_decay,
+            param_groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay,
         )
         print("Using standard AdamW optimizer")
-    
+
     return optimizer
 
 
-def create_scheduler(optimizer: torch.optim.Optimizer, config: Dict, steps_per_epoch: int):
-    """Create learning rate scheduler"""
+def create_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: Dict,
+    steps_per_epoch: int,
+    num_epochs_override: int = None,
+    warmup_epochs_override: int = None,
+):
+    """
+    Create LR scheduler from config.
+
+    num_epochs_override / warmup_epochs_override let Stage-2 use a
+    shorter run length than config['training']['num_epochs'] without
+    polluting the cosine schedule horizon with the unused tail.
+    """
     sched_config = config['training']['scheduler']
     sched_type = sched_config.get('type', 'cosine')
-    
-    num_epochs = config['training']['num_epochs']
-    warmup_epochs = config['training'].get('warmup_epochs', 10)
+
+    num_epochs = num_epochs_override if num_epochs_override is not None else config['training']['num_epochs']
+    warmup_epochs = warmup_epochs_override if warmup_epochs_override is not None else config['training'].get('warmup_epochs', 10)
     min_lr = config['training'].get('min_lr', 1e-6)
-    
+
     warmup_steps = warmup_epochs * steps_per_epoch
     total_steps = num_epochs * steps_per_epoch
-    
+
     if sched_type == 'cosine':
+        # Clamp so warmup_epochs >= num_epochs doesn't yield T_max <= 0.
+        t_max = max(1, total_steps - warmup_steps)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=total_steps - warmup_steps,
-            eta_min=min_lr,
+            optimizer, T_max=t_max, eta_min=min_lr,
         )
     else:
         scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer,
-            step_size=10 * steps_per_epoch,
-            gamma=0.1,
+            optimizer, step_size=max(1, 10 * steps_per_epoch), gamma=0.1,
         )
-    
+
     return scheduler, warmup_steps
+
+
+def _optimizer_step(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    grad_clip: float,
+    warmup_steps: int,
+    global_step: int,
+    total_optimizer_steps: int,
+    ema_start: float,
+    ema_end: float,
+    base_lr: float,
+) -> int:
+    """One optimizer step plus EMA + LR scheduling. Returns the next global_step."""
+    scaler.unscale_(optimizer)
+    if grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad()
+
+    # EMA schedule must be in OPTIMIZER STEPS, not micro-batches.
+    progress = min(1.0, global_step / max(1, total_optimizer_steps))
+    model.ema_momentum = ema_start + (ema_end - ema_start) * progress
+    model.update_target_encoder()
+
+    if global_step < warmup_steps:
+        lr_scale = min(1.0, float(global_step + 1) / max(1, warmup_steps))
+        # Multiply each group's base_lr stored in optimizer.defaults rather
+        # than re-reading the config, so Stage-2's reduced LR is preserved
+        # if warmup is ever enabled for Stage-2.
+        for pg in optimizer.param_groups:
+            pg['lr'] = pg.get('initial_lr', base_lr) * lr_scale
+    else:
+        scheduler.step()
+
+    return global_step + 1
 
 
 def train_one_epoch(
@@ -177,6 +227,11 @@ def train_one_epoch(
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     use_amp = (device == 'cuda')
 
+    # Total optimizer steps (not micro-batches) drive the EMA schedule.
+    steps_per_epoch = max(1, len(dataloader) // grad_accum_steps)
+    total_optimizer_steps = max(1, config['training']['num_epochs'] * steps_per_epoch)
+
+    pending_grad = False  # True between backward() and optimizer.step()
     for batch_idx, batch in enumerate(pbar):
         # Move data to device
         images = batch['images'].to(device)
@@ -215,34 +270,18 @@ def train_one_epoch(
         
         # Backward pass
         scaler.scale(loss).backward()
-        
+        pending_grad = True
+
         # Update weights every grad_accum_steps
         if (batch_idx + 1) % grad_accum_steps == 0:
-            # Unscale gradients and clip
-            scaler.unscale_(optimizer)
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            
-            # Optimizer step
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-            
-            # Update EMA target encoder
-            progress = global_step / (config['training']['num_epochs'] * len(dataloader))
-            ema_momentum = ema_start + (ema_end - ema_start) * progress
-            model.ema_momentum = ema_momentum
-            model.update_target_encoder()
-            
-            # Learning rate warmup
-            if global_step < warmup_steps:
-                lr_scale = min(1.0, float(global_step + 1) / warmup_steps)
-                for pg in optimizer.param_groups:
-                    pg['lr'] = config['training']['learning_rate'] * lr_scale
-            else:
-                scheduler.step()
-            
-            global_step += 1
+            global_step = _optimizer_step(
+                model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler,
+                grad_clip=grad_clip, warmup_steps=warmup_steps,
+                global_step=global_step, total_optimizer_steps=total_optimizer_steps,
+                ema_start=ema_start, ema_end=ema_end,
+                base_lr=config['training']['learning_rate'],
+            )
+            pending_grad = False
         
         # Update meters
         loss_meter.update(loss.item() * grad_accum_steps, images.size(0))
@@ -275,9 +314,22 @@ def train_one_epoch(
         # Clear CUDA cache periodically (CUDA only)
         if device == 'cuda' and batch_idx % empty_cache_every == 0:
             torch.cuda.empty_cache()
-    
+
+    # Flush any partial gradient-accumulation tail at the end of the epoch.
+    # Without this, dataloaders whose length isn't a multiple of grad_accum
+    # drop the last micro-batches' gradients.
+    if pending_grad:
+        global_step = _optimizer_step(
+            model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler,
+            grad_clip=grad_clip, warmup_steps=warmup_steps,
+            global_step=global_step, total_optimizer_steps=total_optimizer_steps,
+            ema_start=ema_start, ema_end=ema_end,
+            base_lr=config['training']['learning_rate'],
+        )
+        pending_grad = False
+
     logger.info(f"Epoch {epoch} - Loss: {loss_meter.avg:.4f}, JEPA Loss: {jepa_loss_meter.avg:.4f}, Contrastive Loss: {contrastive_loss_meter.avg:.4f}")
-    
+
     return loss_meter.avg, global_step
 
 
@@ -326,13 +378,23 @@ def validate(
     # Compute retrieval metrics
     image_embeds = torch.cat(all_image_embeds, dim=0)
     text_embeds = torch.cat(all_text_embeds, dim=0)
-    
-    # Limit to first 1000 samples for faster evaluation
-    if image_embeds.shape[0] > 1000:
-        image_embeds = image_embeds[:1000]
-        text_embeds = text_embeds[:1000]
-    
-    metrics = compute_retrieval_metrics(image_embeds, text_embeds)
+
+    # Cap via config (default: no cap). Was hardcoded to 1000.
+    eval_cfg = config.get('evaluation', {})
+    max_eval_samples = eval_cfg.get('max_eval_samples', None)
+    if max_eval_samples is not None and image_embeds.shape[0] > max_eval_samples:
+        image_embeds = image_embeds[:max_eval_samples]
+        text_embeds = text_embeds[:max_eval_samples]
+
+    # If the dataset provided image_ids and text_image_ids in the batch, use
+    # them for COCO-aware multi-caption retrieval. Otherwise fall back to the
+    # 1-to-1 diagonal assumption (correct for toy/dummy datasets).
+    image_ids = getattr(dataloader.dataset, '_collected_image_ids', None)
+    text_image_ids = getattr(dataloader.dataset, '_collected_text_image_ids', None)
+    metrics = compute_retrieval_metrics(
+        image_embeds, text_embeds,
+        image_ids=image_ids, text_image_ids=text_image_ids,
+    )
     metrics['val_loss'] = loss_meter.avg
     
     logger.info(f"Validation Epoch {epoch} - Loss: {loss_meter.avg:.4f}")
@@ -540,7 +602,7 @@ def main():
         )
 
         # Validate (if val_loader exists)
-        val_metrics = {'val_loss': float('inf'), 'mean_recall': 0.0}
+        val_metrics = None
         if val_loader is not None:
             val_metrics = validate(
                 model=model,
@@ -550,26 +612,38 @@ def main():
                 logger=logger,
                 device=device,
             )
-        
-        # Determine if this is the best model
-        if args.stage2:
-            # Stage-2: Use mean_recall (higher is better)
-            current_mean_recall = val_metrics.get('mean_recall', 0.0)
-            is_best = current_mean_recall > best_mean_recall
-            if is_best:
-                best_mean_recall = current_mean_recall
-                epochs_without_improvement = 0
-                logger.info(f"Stage-2: New best mean_recall = {best_mean_recall:.2f}%")
-            else:
-                epochs_without_improvement += 1
-                logger.info(f"Stage-2: No improvement for {epochs_without_improvement} epoch(s)")
-            
-            # Early stopping check
-            if epochs_without_improvement >= early_stop_patience:
-                logger.info(f"Stage-2: Early stopping triggered (no improvement for {early_stop_patience} epochs)")
-                break
+
+        # Determine if this is the best model. When no val_loader is
+        # available, fall back to train_loss for Stage-1 and disable early
+        # stopping for Stage-2 (we can't measure mean_recall).
+        if val_metrics is None:
+            val_metrics = {'val_loss': train_loss, 'mean_recall': 0.0}
+            no_val = True
         else:
-            # Stage-1: Use val_loss (lower is better)
+            no_val = False
+
+        if args.stage2:
+            if no_val:
+                # No val_loader: skip mean_recall tracking and early stopping.
+                is_best = True
+                logger.warning("Stage-2 without val_loader: saving every epoch, early stopping disabled.")
+            else:
+                # Stage-2: Use mean_recall (higher is better)
+                current_mean_recall = val_metrics.get('mean_recall', 0.0)
+                is_best = current_mean_recall > best_mean_recall
+                if is_best:
+                    best_mean_recall = current_mean_recall
+                    epochs_without_improvement = 0
+                    logger.info(f"Stage-2: New best mean_recall = {best_mean_recall:.2f}%")
+                else:
+                    epochs_without_improvement += 1
+                    logger.info(f"Stage-2: No improvement for {epochs_without_improvement} epoch(s)")
+                if epochs_without_improvement >= early_stop_patience:
+                    logger.info(f"Stage-2: Early stopping triggered (no improvement for {early_stop_patience} epochs)")
+                    break
+        else:
+            # Stage-1: val_loss (lower is better). When no val_loader, val_loss
+            # falls back to train_loss above, so progress still updates best.
             is_best = val_metrics['val_loss'] < best_metric
             if is_best:
                 best_metric = val_metrics['val_loss']
