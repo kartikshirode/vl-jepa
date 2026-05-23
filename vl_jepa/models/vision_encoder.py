@@ -158,8 +158,10 @@ class VisionEncoder(nn.Module):
         if hasattr(self.model, 'get_intermediate_layers'):
             return self.model.get_intermediate_layers(x, n)
         else:
-            # Fallback: just return final output
-            return [self.forward(x)]
+            # Fallback: return the final patch tokens. The default forward
+            # would collapse to a CLS-only tensor when return_all_tokens=False,
+            # which is not what an intermediate-layers consumer expects.
+            return [self.forward(x, return_all_tokens=True)]
     
     def get_num_patches(self) -> int:
         """Get number of patches per image"""

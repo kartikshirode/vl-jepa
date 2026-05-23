@@ -61,28 +61,39 @@ class VLJEPAInference:
         print("Model loaded successfully!")
     
     @torch.no_grad()
-    def encode_image(self, image_path: str) -> torch.Tensor:
+    def encode_image(self, image_path: str, pool: str = 'cls') -> torch.Tensor:
         """
         Encode image to embedding.
-        
+
         Args:
-            image_path: Path to image file
-            
+            image_path: Path to image file.
+            pool: How to pool the ViT output before the projection head.
+                'cls' uses the CLS token (matches the contrastive head used at
+                train time). 'mean' averages over patch tokens, which often
+                works better when downstream tasks lean on the JEPA-trained
+                patch representations rather than the CLS slot.
+
         Returns:
             Image embedding [D]
         """
         # Load and transform image
         image = Image.open(image_path).convert('RGB')
         image_tensor = self.transform(image).unsqueeze(0).to(self.device)
-        
-        # Encode image
-        vision_features = self.model.vision_encoder(image_tensor, return_all_tokens=False)
-        vision_features = vision_features.squeeze(1)  # Remove sequence dim
-        
+
+        if pool == 'cls':
+            vision_features = self.model.vision_encoder(image_tensor, return_all_tokens=False)
+            vision_features = vision_features.squeeze(1)
+        elif pool == 'mean':
+            all_tokens = self.model.vision_encoder(image_tensor, return_all_tokens=True)
+            num_prefix = getattr(self.model.vision_encoder, 'num_prefix_tokens', 1)
+            vision_features = all_tokens[:, num_prefix:, :].mean(dim=1)
+        else:
+            raise ValueError(f"Unknown pool mode: {pool!r}. Use 'cls' or 'mean'.")
+
         # Project to shared space
         vision_embed = self.model.vision_projection(vision_features)
         vision_embed = F.normalize(vision_embed, dim=-1)
-        
+
         return vision_embed.squeeze(0).cpu()
     
     @torch.no_grad()
@@ -181,6 +192,7 @@ class VLJEPAInference:
         self,
         image_paths: List[str],
         batch_size: int = 32,
+        pool: str = 'cls',
     ) -> torch.Tensor:
         """
         Encode and normalize a list of images into one [N, D] tensor.
@@ -188,6 +200,11 @@ class VLJEPAInference:
         Use this to pre-compute embeddings once, then query repeatedly via
         `find_best_image` without re-encoding. Replaces the O(N) re-encode
         loop the previous implementation did per query.
+
+        Args:
+            image_paths: Paths to images.
+            batch_size: Forward-pass batch size.
+            pool: 'cls' or 'mean'; see `encode_image` for the tradeoff.
         """
         embeds = []
         for start in range(0, len(image_paths), batch_size):
@@ -197,7 +214,14 @@ class VLJEPAInference:
                 img = Image.open(p).convert('RGB')
                 tensors.append(self.transform(img))
             batch = torch.stack(tensors, dim=0).to(self.device)
-            features = self.model.vision_encoder(batch, return_all_tokens=False).squeeze(1)
+            if pool == 'cls':
+                features = self.model.vision_encoder(batch, return_all_tokens=False).squeeze(1)
+            elif pool == 'mean':
+                tokens = self.model.vision_encoder(batch, return_all_tokens=True)
+                num_prefix = getattr(self.model.vision_encoder, 'num_prefix_tokens', 1)
+                features = tokens[:, num_prefix:, :].mean(dim=1)
+            else:
+                raise ValueError(f"Unknown pool mode: {pool!r}. Use 'cls' or 'mean'.")
             proj = self.model.vision_projection(features)
             embeds.append(F.normalize(proj, dim=-1).cpu())
         return torch.cat(embeds, dim=0)
