@@ -101,28 +101,34 @@ partial logs.
 
 Kaggle kills any session that exceeds 12 hours. At ~4 it/s on T4 with batch
 32, one epoch is ~80 min (train + val), so a full 20-epoch run takes
-~27 hours and spans 2-3 sessions. The kernel script auto-resumes between
-sessions:
+~27 hours and spans 2-3 sessions.
 
-1. `kernel-metadata.json` lists the kernel itself in `kernel_sources`, so
-   every new push mounts the previous version's `/kaggle/working/` at
-   `/kaggle/input/<slug>/`.
-2. `train_kaggle.py` scans `/kaggle/input/<slug>/checkpoints/` for the
-   highest `checkpoint_epoch_N.pth` and passes it to `train.py --resume`.
-3. `train.py` restores model + optimizer + scheduler + EMA + epoch counter
-   from the checkpoint and continues from epoch N+1.
+The training side is fully prepared for resume: per-epoch checkpoints save
+to `/kaggle/working/checkpoints/` (kept to the latest 2 by
+`keep_last_n_checkpoints: 2`), and `train_kaggle.py` will pick up the
+highest-epoch checkpoint from `/kaggle/input/<slug>/checkpoints/` if one
+is mounted and pass it to `train.py --resume`.
 
-To run subsequent sessions, just trigger the kernel again - no code edits.
-Either:
-- Click "Save Version" -> "Save & Run All (Commit)" on the kernel page, or
-- `kaggle kernels push -p scripts/kaggle/` from CLI.
+What requires a manual click: Kaggle's CLI does not allow a kernel to
+list itself in `kernel_sources`, so the previous run's output has to be
+attached via the web UI between sessions. The flow is:
 
-Either action creates a new committed version with the same code; the
-self-referencing `kernel_sources` ensures the previous version's
-checkpoints are mounted at runtime. Expect ~8 epochs per session at 4 it/s,
-so 3 sessions covers a 20-epoch run with margin. Save frequency is every
-2 epochs (`save_every: 2` in the config), so each session loses at most
-two epochs of work if it ends mid-checkpoint.
+1. **Session 1**: open the kernel page, click "Save Version" ->
+   "Save & Run All (Commit)". No prior output exists, so the script
+   starts at epoch 0. Session runs until the 12-hour cap (~9 epochs).
+2. **Session 2** (after Session 1 finishes / times out): on the kernel
+   page, click "Add Input" (right panel) -> "Notebook Output" tab -> pick
+   the version that just finished -> "Add". This mounts that version's
+   `/kaggle/working/` at `/kaggle/input/<slug>/`. Then click "Save
+   Version" -> "Save & Run All (Commit)". The script auto-detects the
+   checkpoint and resumes from where Session 1 left off.
+3. **Session 3 (if needed)**: same as Session 2 but pick Session 2's
+   version as the input.
+
+Save frequency is every 2 epochs (`save_every: 2`), so each session loses
+at most two epochs of work if it ends mid-checkpoint. With 4 it/s and
+20 epochs, expect 2-3 sessions and roughly one manual attach click
+between each pair.
 
 ## Pulling the final outputs
 

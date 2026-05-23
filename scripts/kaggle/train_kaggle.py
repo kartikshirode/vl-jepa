@@ -4,24 +4,27 @@ This script is the `code_file` referenced by `kernel-metadata.json`. It runs
 inside the Kaggle kernel runtime and handles environment setup, dependency
 install, repo clone, optional checkpoint resume, and the training launch.
 
-Requirements (set in kernel-metadata.json + once in the web UI):
+Requirements (set in the web UI on first run, then sticky):
   - Accelerator: "GPU T4 x2" (this script only uses the first T4)
   - Internet: enabled
   - Input dataset: awsaf49/coco-2017-dataset
-  - kernel_sources self-reference: lets each new run mount the previous
-    run's /kaggle/working/ as input so checkpoints carry over across the
-    12-hour session cap.
 
-Auto-resume flow:
+Auto-resume flow (manual one-click attach between sessions):
   - Session 1 (no prior output): no checkpoint mounted, starts at epoch 0.
   - Each session saves checkpoint_epoch_N.pth into /kaggle/working/checkpoints/
-    every `save_every` epochs (configured as 2).
-  - Session 2+: this script finds the highest-epoch checkpoint under
-    /kaggle/input/<self-slug>/checkpoints/ and passes it to train.py via
-    --resume. train.py restores model + optimizer + scheduler + EMA + epoch.
-  - Repeat sessions by clicking "Save & Run All" in the kernel's web UI
-    (or `kaggle kernels push -p scripts/kaggle/` from CLI) until num_epochs
-    completes. No code edits needed between sessions.
+    every `save_every` epochs (configured as 2). Old checkpoints are
+    pruned to the latest `keep_last_n_checkpoints` (configured as 2) to
+    keep /kaggle/working well under its 20 GB cap.
+  - Session 2+: before triggering, open the kernel page in a browser and
+    click "Add Input" -> "Notebook Output" -> pick the previous version
+    of THIS kernel -> Save. That mounts the previous /kaggle/working/ at
+    /kaggle/input/<slug>/. (Kaggle's CLI rejects a kernel listing itself
+    in kernel_sources, so this step is unavoidably manual.) Then click
+    "Save Version" -> "Save & Run All (Commit)".
+  - This script's find_resume_checkpoint scans the candidate paths,
+    locates the highest-epoch checkpoint, and passes it to train.py via
+    --resume. train.py restores model + optimizer + scheduler + EMA +
+    epoch counter automatically; no edits needed.
 
 Why T4 and not P100: Kaggle's PyTorch (>= 2.10) dropped Pascal (sm_60), so
 a P100 kernel fails to launch CUDA. T4 is Turing (sm_75) and supported.
