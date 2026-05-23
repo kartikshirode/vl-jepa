@@ -232,9 +232,22 @@ class MultiBlockMaskGenerator:
 
 
 def create_mask_generator(config: dict) -> MultiBlockMaskGenerator:
-    """Build a MultiBlockMaskGenerator from a config dict."""
-    mask_config = config.get('masking', {})
-    vision_config = config.get('vision_encoder', {})
+    """Build a MultiBlockMaskGenerator from a config dict.
+
+    Accepts either the full top-level config (preferred) or just the 'data'
+    sub-dict (legacy). In both cases the mask config is read from
+    config['data']['masking'] (or config['masking'] for the legacy form),
+    and image_size / patch_size come from config['model']['vision_encoder'].
+    """
+    # Detect which form was passed.
+    if 'data' in config and isinstance(config['data'], dict):
+        mask_config = config['data'].get('masking', {})
+        vision_config = config.get('model', {}).get('vision_encoder', {})
+    else:
+        # Legacy: caller passed config['data']. Vision sizes will fall back
+        # to defaults, which is only safe if the model uses 224 / 16.
+        mask_config = config.get('masking', {})
+        vision_config = config.get('vision_encoder', {})
 
     input_size = vision_config.get('image_size', 224)
     patch_size = vision_config.get('patch_size', 16)

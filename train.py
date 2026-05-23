@@ -39,6 +39,22 @@ except ImportError:
     print("Warning: bitsandbytes not found. Using standard AdamW.")
 
 
+def _worker_init(worker_id: int):
+    """Seed numpy and Python random per worker so mask sampling is distinct.
+
+    PyTorch seeds the torch RNG per worker but does not consistently seed
+    numpy across all versions. Without this init fn, every worker can replay
+    the same numpy sequence and the per-sample JEPA mask becomes deterministic
+    per dataset index, collapsing mask diversity over a multi-day run.
+    """
+    import numpy as _np
+    import random as _random
+    base = torch.initial_seed()
+    seed = (base + worker_id) % (2 ** 32)
+    _np.random.seed(seed)
+    _random.seed(seed)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train VL-JEPA model")
     parser.add_argument("--config", type=str, default="config_dgpu.yaml", help="Path to config file")
@@ -160,26 +176,38 @@ def _optimizer_step(
     scaler.unscale_(optimizer)
     if grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+    # Detect optimizer-step skip from GradScaler. When inf/nan grads are
+    # present, scaler.step() returns without calling optimizer.step() and
+    # scaler.update() reduces the loss scale. EMA + scheduler advancing on a
+    # skipped step subtly desyncs the cosine schedule from real progress.
+    before_scale = scaler.get_scale()
     scaler.step(optimizer)
     scaler.update()
+    after_scale = scaler.get_scale()
     optimizer.zero_grad()
+    skipped = after_scale < before_scale
 
-    # EMA schedule must be in OPTIMIZER STEPS, not micro-batches.
-    progress = min(1.0, global_step / max(1, total_optimizer_steps))
-    model.ema_momentum = ema_start + (ema_end - ema_start) * progress
-    model.update_target_encoder()
+    if not skipped:
+        # EMA schedule must be in OPTIMIZER STEPS, not micro-batches.
+        progress = min(1.0, global_step / max(1, total_optimizer_steps))
+        model.ema_momentum = ema_start + (ema_end - ema_start) * progress
+        model.update_target_encoder()
 
-    if global_step < warmup_steps:
-        lr_scale = min(1.0, float(global_step + 1) / max(1, warmup_steps))
-        # Multiply each group's base_lr stored in optimizer.defaults rather
-        # than re-reading the config, so Stage-2's reduced LR is preserved
-        # if warmup is ever enabled for Stage-2.
-        for pg in optimizer.param_groups:
-            pg['lr'] = pg.get('initial_lr', base_lr) * lr_scale
-    else:
-        scheduler.step()
+        if global_step < warmup_steps:
+            lr_scale = min(1.0, float(global_step + 1) / max(1, warmup_steps))
+            # Multiply each group's base_lr stored in optimizer.defaults rather
+            # than re-reading the config, so Stage-2's reduced LR is preserved
+            # if warmup is ever enabled for Stage-2.
+            for pg in optimizer.param_groups:
+                pg['lr'] = pg.get('initial_lr', base_lr) * lr_scale
+        else:
+            scheduler.step()
 
-    return global_step + 1
+        return global_step + 1
+
+    # On skip, leave global_step / scheduler / EMA exactly where they were.
+    return global_step
 
 
 def train_one_epoch(
@@ -229,7 +257,8 @@ def train_one_epoch(
     use_amp = (device == 'cuda')
 
     # Total optimizer steps (not micro-batches) drive the EMA schedule.
-    steps_per_epoch = max(1, len(dataloader) // grad_accum_steps)
+    # Use ceiling division so the partial-tail flush at end-of-epoch counts.
+    steps_per_epoch = max(1, -(-len(dataloader) // grad_accum_steps))
     total_optimizer_steps = max(1, config['training']['num_epochs'] * steps_per_epoch)
 
     pending_grad = False  # True between backward() and optimizer.step()
@@ -366,6 +395,7 @@ def validate(
     all_image_ids = []
 
     use_wandb = config['logging'].get('use_wandb', False)
+    use_amp = (device == 'cuda')
 
     pbar = tqdm(dataloader, desc=f"Validation Epoch {epoch}")
 
@@ -374,13 +404,16 @@ def validate(
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
 
-        # Forward pass
-        outputs = model(
-            images=images,
-            text_input_ids=input_ids,
-            text_attention_mask=attention_mask,
-            mode="contrastive",
-        )
+        # Forward pass under autocast on CUDA. Without this, validation runs
+        # in FP32 at 2x the train batch size, which is the biggest single OOM
+        # hazard on 8 GB cards.
+        with autocast(device_type=device, enabled=use_amp):
+            outputs = model(
+                images=images,
+                text_input_ids=input_ids,
+                text_attention_mask=attention_mask,
+                mode="contrastive",
+            )
 
         # Collect embeddings
         all_image_embeds.append(outputs['vision_embed'].cpu())
@@ -473,20 +506,40 @@ def main():
     model = create_vl_jepa_model(config)
     model = model.to(device)
 
+    # Cache the tokenizer reference BEFORE torch.compile wraps the model.
+    # OptimizedModule attribute forwarding to _orig_mod is not reliable across
+    # torch versions for non-Module attributes, and the dataset construction
+    # below needs the live tokenizer object.
+    tokenizer = model.text_encoder.tokenizer
+
     # Optional torch.compile. Adds ~30s on first forward; only worth it for
-    # production runs where the graph is stable. Wrap AFTER moving to device.
+    # production runs where the graph is stable. Wrap AFTER moving to device
+    # and AFTER grabbing the tokenizer.
     if args.compile:
         if not hasattr(torch, 'compile'):
             logger.warning("--compile requested but torch.compile is unavailable in this PyTorch build")
         else:
+            logger.warning(
+                "--compile enabled. torch.compile interacts poorly with EMA, "
+                "deepcopy and dynamic shapes. For multi-day runs, verify on a "
+                "single-epoch dry run first."
+            )
             logger.info("torch.compile(mode='reduce-overhead') enabled")
             model = torch.compile(model, mode='reduce-overhead')
 
     # Stage-2: Freeze text encoder
     if args.stage2:
+        # Stage-2 fine-tunes a Stage-1 checkpoint; without --resume we'd be
+        # silently training from scratch with frozen text, which is useless.
+        if not args.resume:
+            raise SystemExit(
+                "--stage2 requires --resume <stage1-checkpoint>. Refusing to "
+                "start Stage-2 fine-tuning from random weights."
+            )
         logger.info("=" * 50)
         logger.info("STAGE-2 TRAINING MODE")
         logger.info("=" * 50)
+        logger.info(f"Stage-2: Will load Stage-1 weights from {args.resume}")
         freeze_info = model.freeze_text_encoder()
         logger.info(f"Frozen text encoder parameters: {freeze_info['frozen_text_params'] / 1e6:.2f}M")
         logger.info(f"Trainable parameters: {freeze_info['trainable_params'] / 1e6:.2f}M")
@@ -516,8 +569,10 @@ def main():
     train_transform = get_train_transforms(config['data'])
     val_transform = get_val_transforms(config['data'])
 
-    tokenizer = model.text_encoder.tokenizer
-    mask_generator = create_mask_generator(config['data'])
+    # tokenizer was captured pre-compile above.
+    # Pass the full config so the mask generator can read both data.masking
+    # (block scales, counts) and model.vision_encoder (image_size, patch_size).
+    mask_generator = create_mask_generator(config)
 
     train_dataset = create_dataset(
         config,
@@ -555,27 +610,39 @@ def main():
     if num_workers > 0:
         train_loader_kwargs['persistent_workers'] = config['data'].get('persistent_workers', True)
         train_loader_kwargs['prefetch_factor'] = config['data'].get('prefetch_factor', 2)
+        train_loader_kwargs['worker_init_fn'] = _worker_init
     
     train_loader = DataLoader(train_dataset, **train_loader_kwargs)
     
     val_loader = None
     if val_dataset is not None:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=config['training']['batch_size'] * 2,
-            shuffle=False,
-            num_workers=config['data'].get('num_workers', 2),
-            pin_memory=config['data'].get('pin_memory', True),
-            collate_fn=jepa_collate_fn,
-        )
+        # Match train batch size (no 2x multiplier); 8 GB cards OOM mid-run
+        # otherwise. A config flag (training.val_batch_size_factor) overrides.
+        val_bs_factor = config['training'].get('val_batch_size_factor', 1)
+        val_num_workers = config['data'].get('num_workers', 2)
+        val_loader_kwargs = {
+            'batch_size': config['training']['batch_size'] * val_bs_factor,
+            'shuffle': False,
+            'num_workers': val_num_workers,
+            'pin_memory': config['data'].get('pin_memory', True),
+            'collate_fn': jepa_collate_fn,
+        }
+        if val_num_workers > 0:
+            val_loader_kwargs['worker_init_fn'] = _worker_init
+        val_loader = DataLoader(val_dataset, **val_loader_kwargs)
     
     # Mask generator already built and passed into create_dataset above;
     # the trainer no longer needs a separate reference (kept as a no-op
     # arg into train_one_epoch for back-compat).
 
-    # Create optimizer and scheduler (with Stage-2 settings if applicable)
+    # Create optimizer and scheduler (with Stage-2 settings if applicable).
+    # steps_per_epoch must be in optimizer steps (post grad-accum), not in
+    # micro-batches, otherwise the cosine T_max is sized too long and the LR
+    # never reaches min_lr by end of training.
+    grad_accum_steps = config['training']['gradient_accumulation_steps']
+    steps_per_epoch_opt = max(1, -(-len(train_loader) // grad_accum_steps))
     optimizer = create_optimizer(model, config, stage2=args.stage2, stage2_lr_factor=args.stage2_lr_factor)
-    scheduler, warmup_steps = create_scheduler(optimizer, config, len(train_loader))
+    scheduler, warmup_steps = create_scheduler(optimizer, config, steps_per_epoch_opt)
     
     # Create gradient scaler for mixed precision (no-op on CPU)
     scaler = GradScaler(device=device, enabled=(device == 'cuda'))
