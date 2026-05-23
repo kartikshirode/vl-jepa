@@ -22,8 +22,12 @@
 #   - training.num_epochs: 20 (down from 30). Kaggle Notebooks have a 12-hour
 #     session cap. T4 at ~25-30 min/epoch lands ~8-10 hours, comfortable margin.
 #   - training.warmup_epochs: 2 (down from 3). ~10% of total, same ratio.
-#   - data.num_workers: 2. Kaggle gives 4 CPU cores; leave headroom for the
-#     main process and the I/O thread.
+#   - data.num_workers: 4. Kaggle's T4 x2 environment provides 4 vCPUs and the
+#     /kaggle/input filesystem is network-mounted, so JPEG decode + augment is
+#     the bottleneck. Use every CPU; the main process barely loads anything.
+#   - data.prefetch_factor: 8. With 4 workers buffering 8 batches each, the
+#     loader can mask a longer tail of slow disk reads. Memory cost ~38 MB
+#     per batch in fp16, so 4 x 8 = 32 batches = 1.2 GB; well within budget.
 #   - data.persistent_workers: true. The single-shot run benefits from keeping
 #     workers alive across val passes.
 #   - training.save_every: 2 (down from 5). Cheap insurance against session
@@ -105,9 +109,9 @@ data:
   val_split: "val"
   max_samples: null
 
-  num_workers: 2
+  num_workers: 4
   pin_memory: true
-  prefetch_factor: 4
+  prefetch_factor: 8
   persistent_workers: true
 
   image_transforms:
