@@ -2,11 +2,18 @@
 Checkpoint management utilities
 """
 
+import os
 import torch
 import torch.nn as nn
 from pathlib import Path
 from typing import Dict, Optional, Any
 import json
+import warnings
+
+
+def _config_sidecar_path(ckpt_path: Path) -> Path:
+    """Sibling JSON file that holds the run config for a checkpoint."""
+    return ckpt_path.with_suffix(ckpt_path.suffix + ".config.json")
 
 
 def save_checkpoint(
@@ -21,47 +28,57 @@ def save_checkpoint(
     is_best: bool = False,
 ):
     """
-    Save model checkpoint.
-    
-    Args:
-        model: Model to save
-        optimizer: Optimizer state
-        scheduler: LR scheduler state
-        epoch: Current epoch
-        global_step: Global training step
-        best_metric: Best validation metric so far
-        config: Training configuration
-        save_path: Path to save checkpoint
-        is_best: Whether this is the best model
+    Save model checkpoint atomically. The run config is written as a sibling
+    `.config.json` file so the checkpoint payload itself stays loadable with
+    `torch.load(..., weights_only=True)`.
     """
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Prepare checkpoint
+
     checkpoint = {
         'epoch': epoch,
         'global_step': global_step,
         'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
         'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'best_metric': best_metric,
-        'config': config,
     }
-    
-    # Save checkpoint
-    torch.save(checkpoint, save_path)
+
+    tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, save_path)
     print(f"Checkpoint saved to {save_path}")
-    
-    # Save best model separately
+
+    sidecar = _config_sidecar_path(save_path)
+    with open(sidecar, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2)
+
     if is_best:
         best_path = save_path.parent / 'best_model.pth'
-        torch.save(checkpoint, best_path)
+        best_tmp = best_path.with_suffix(best_path.suffix + ".tmp")
+        torch.save(checkpoint, best_tmp)
+        os.replace(best_tmp, best_path)
+        best_sidecar = _config_sidecar_path(best_path)
+        with open(best_sidecar, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2)
         print(f"Best model saved to {best_path}")
-    
-    # Save config as JSON
-    config_path = save_path.parent / 'config.json'
-    with open(config_path, 'w') as f:
-        json.dump(config, f, indent=2)
+
+
+def _torch_load_safely(checkpoint_path: Path, device: str) -> Dict[str, Any]:
+    """
+    Try a weights_only load first (safe). On failure, fall back to the legacy
+    pickle load with a loud warning so old checkpoints still work.
+    """
+    try:
+        return torch.load(checkpoint_path, map_location=device, weights_only=True)
+    except Exception as e:
+        warnings.warn(
+            f"weights_only=True load failed for {checkpoint_path} ({e}). "
+            "Falling back to legacy pickle load. Re-save this checkpoint to "
+            "drop the warning.",
+            RuntimeWarning,
+        )
+        return torch.load(checkpoint_path, map_location=device, weights_only=False)
 
 
 def load_checkpoint(
@@ -71,84 +88,65 @@ def load_checkpoint(
     scheduler: Optional[Any] = None,
     device: str = 'cuda',
 ) -> Dict[str, Any]:
-    """
-    Load model checkpoint.
-    
-    Args:
-        checkpoint_path: Path to checkpoint file
-        model: Model to load weights into
-        optimizer: Optional optimizer to load state into
-        scheduler: Optional scheduler to load state into
-        device: Device to load checkpoint to
-        
-    Returns:
-        Dictionary with checkpoint info (epoch, step, etc.)
-    """
+    """Load a checkpoint into the supplied model/optimizer/scheduler."""
     checkpoint_path = Path(checkpoint_path)
-    
+
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    
+
     print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Load model weights
+    checkpoint = _torch_load_safely(checkpoint_path, device)
+
     model.load_state_dict(checkpoint['model_state_dict'])
     print("Model weights loaded")
-    
-    # Load optimizer state
-    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+
+    if optimizer is not None and checkpoint.get('optimizer_state_dict') is not None:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         print("Optimizer state loaded")
-    
-    # Load scheduler state
+
     if scheduler is not None and checkpoint.get('scheduler_state_dict') is not None:
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         print("Scheduler state loaded")
-    
-    # Return checkpoint info
+
+    # Pull config from sibling JSON if it exists, else from inside the payload
+    # (legacy checkpoints), else empty.
+    sidecar = _config_sidecar_path(checkpoint_path)
+    if sidecar.exists():
+        with open(sidecar, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+    else:
+        cfg = checkpoint.get('config', {}) or {}
+
     info = {
         'epoch': checkpoint.get('epoch', 0),
         'global_step': checkpoint.get('global_step', 0),
         'best_metric': checkpoint.get('best_metric', float('inf')),
-        'config': checkpoint.get('config', {}),
+        'config': cfg,
     }
-    
+
     print(f"Checkpoint loaded: epoch={info['epoch']}, step={info['global_step']}")
-    
+
     return info
 
 
 def save_model_only(model: nn.Module, save_path: str):
-    """
-    Save only model weights (for inference/deployment).
-    
-    Args:
-        model: Model to save
-        save_path: Path to save model
-    """
+    """Save model weights only (atomic, safe-load friendly)."""
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    torch.save(model.state_dict(), save_path)
+    tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
+    torch.save(model.state_dict(), tmp_path)
+    os.replace(tmp_path, save_path)
     print(f"Model weights saved to {save_path}")
 
 
 def load_model_only(model: nn.Module, checkpoint_path: str, device: str = 'cuda'):
-    """
-    Load only model weights.
-    
-    Args:
-        model: Model to load weights into
-        checkpoint_path: Path to checkpoint file
-        device: Device to load to
-    """
+    """Load model weights only."""
     checkpoint_path = Path(checkpoint_path)
-    
+
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    
-    state_dict = torch.load(checkpoint_path, map_location=device)
+
+    state_dict = _torch_load_safely(checkpoint_path, device)
     model.load_state_dict(state_dict)
     print(f"Model weights loaded from {checkpoint_path}")
 
