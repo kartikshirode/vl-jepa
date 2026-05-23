@@ -176,7 +176,7 @@ class VLJEPAModel(nn.Module):
         """
         if stage2:
             # Stage-2: Only vision encoder, predictor, and projection heads
-            return [
+            groups = [
                 {'params': list(self.vision_encoder.parameters()), 'lr': base_lr},
                 {'params': list(self.predictor.parameters()), 'lr': base_lr},
                 {'params': list(self.vision_projection.parameters()), 'lr': base_lr},
@@ -184,13 +184,25 @@ class VLJEPAModel(nn.Module):
             ]
         else:
             # Stage-1: All parameters
-            return [
+            groups = [
                 {'params': list(self.vision_encoder.parameters()), 'lr': base_lr},
                 {'params': list(self.text_encoder.parameters()), 'lr': base_lr},
                 {'params': list(self.predictor.parameters()), 'lr': base_lr},
                 {'params': list(self.vision_projection.parameters()), 'lr': base_lr},
                 {'params': list(self.text_projection.parameters()), 'lr': base_lr},
             ]
+
+        # SigLIP logit scale/bias are nn.Parameters attached to the top-level
+        # module, so they don't live inside any of the submodule groups above.
+        # Without this they'd receive gradients but never get a weight update.
+        if hasattr(self, 'siglip_logit_scale') and hasattr(self, 'siglip_logit_bias'):
+            groups.append({
+                'params': [self.siglip_logit_scale, self.siglip_logit_bias],
+                'lr': base_lr,
+                'weight_decay': 0.0,
+            })
+
+        return groups
     
     def verify_frozen_text_encoder(self):
         """
@@ -459,34 +471,77 @@ class VLJEPAModel(nn.Module):
             outputs['loss'] = contrastive_loss
 
         elif mode == "both":
-            # JEPA path: context encoder sees only visible patches.
-            jepa_out = self.forward_jepa(
-                images=images,
-                context_indices=context_indices,
-                target_indices=target_indices,
-                context_mask=context_mask,
-                target_mask=target_mask,
-            )
-            jepa_loss = self.compute_jepa_loss(
-                jepa_out['predicted_vision'],
-                jepa_out['target_vision'],
-            )
+            # When the predictor is cross-attention based, forward_jepa() would
+            # call text_encoder once (full token sequence for cross-attn) and
+            # then forward_contrastive() would call it again (CLS pooled). That
+            # doubles the text encoder work for every "both" batch. Detect this
+            # case and encode text once.
+            is_cross_attn = isinstance(self.predictor, PredictorWithCrossAttention)
 
-            # Contrastive path: run a separate CLS-only forward over the full
-            # image. Reusing the masked context_repr for contrastive would
-            # change retrieval semantics (mean-of-context vs CLS), so we accept
-            # the extra encoder pass to keep contrastive identical to the
-            # standalone forward_contrastive path.
-            contrastive_out = self.forward_contrastive(images, text_input_ids, text_attention_mask)
-            contrastive_loss = self.compute_contrastive_loss(
-                contrastive_out['vision_embed'],
-                contrastive_out['text_embed'],
-            )
+            if is_cross_attn and text_input_ids is not None:
+                # Single text pass: get all tokens (for cross-attn into predictor)
+                # plus the CLS pool (for contrastive). text_encoder returns the
+                # full sequence including CLS at position 0 when
+                # return_all_tokens=True.
+                text_tokens_full = self.text_encoder(
+                    text_input_ids, text_attention_mask,
+                    return_all_tokens=True, return_projected=False,
+                )
+                # Index 0 == CLS for DistilBERT / BERT-family encoders.
+                text_cls = text_tokens_full[:, 0, :]
+
+                # JEPA path: context encoder over visible patches, predictor
+                # receives both the patches and the precomputed text tokens.
+                context_repr = self.vision_encoder.forward_context(images, context_indices)
+                predicted_vision = self.predictor(
+                    context_repr, context_indices, target_indices,
+                    text_features=text_tokens_full,
+                    text_attention_mask=text_attention_mask,
+                )
+                with torch.no_grad():
+                    target_full = self.target_vision_encoder(images, return_all_tokens=True)
+                    target_vision = self._gather_target_patches(target_full, target_indices)
+
+                jepa_out = {
+                    'predicted_vision': predicted_vision,
+                    'target_vision': target_vision.detach(),
+                    'context_repr': context_repr,
+                    'context_indices': context_indices,
+                    'target_indices': target_indices,
+                    'context_mask': context_mask,
+                    'target_mask': target_mask,
+                }
+                jepa_loss = self.compute_jepa_loss(predicted_vision, target_vision)
+
+                # Contrastive path: reuse the text CLS we already have; only
+                # vision still needs its CLS-only pooled forward.
+                vision_features = self.vision_encoder(images, return_all_tokens=False).squeeze(1)
+                vision_embed = F.normalize(self.vision_projection(vision_features), dim=-1)
+                text_embed = F.normalize(self.text_projection(text_cls), dim=-1)
+                contrastive_loss = self.compute_contrastive_loss(vision_embed, text_embed)
+            else:
+                # Non-text-conditioned predictor: original two-pass path is fine
+                # because forward_jepa skips the text encoder entirely.
+                jepa_out = self.forward_jepa(
+                    images=images,
+                    context_indices=context_indices,
+                    target_indices=target_indices,
+                    context_mask=context_mask,
+                    target_mask=target_mask,
+                )
+                jepa_loss = self.compute_jepa_loss(
+                    jepa_out['predicted_vision'],
+                    jepa_out['target_vision'],
+                )
+                contrastive_out = self.forward_contrastive(images, text_input_ids, text_attention_mask)
+                vision_embed = contrastive_out['vision_embed']
+                text_embed = contrastive_out['text_embed']
+                contrastive_loss = self.compute_contrastive_loss(vision_embed, text_embed)
 
             outputs = {
                 **jepa_out,
-                'vision_embed': contrastive_out['vision_embed'],
-                'text_embed': contrastive_out['text_embed'],
+                'vision_embed': vision_embed,
+                'text_embed': text_embed,
                 'jepa_loss': jepa_loss,
                 'contrastive_loss': contrastive_loss,
             }

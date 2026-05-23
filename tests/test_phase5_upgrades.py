@@ -61,6 +61,27 @@ def test_text_conditioned_predictor_shape():
     assert out['predicted_vision'].shape[1] == tgt_idx.shape[1]
 
 
+def test_siglip_params_in_optimizer_groups():
+    """SigLIP logit scale/bias must be in get_parameter_groups output so the
+    optimizer actually updates them. Regression for the 'gradients flow but
+    weights never move' bug."""
+    predictor = PredictorTransformer(input_dim=192, hidden_dim=384, output_dim=192,
+                                     num_layers=2, num_heads=6, num_patches=196)
+    model = _build_model(predictor, contrastive='siglip')
+    groups = model.get_parameter_groups(base_lr=1e-3, stage2=False)
+    all_params = [p for g in groups for p in g['params']]
+    assert any(p is model.siglip_logit_scale for p in all_params), \
+        "siglip_logit_scale missing from optimizer param groups"
+    assert any(p is model.siglip_logit_bias for p in all_params), \
+        "siglip_logit_bias missing from optimizer param groups"
+
+    # Same check under stage2.
+    groups2 = model.get_parameter_groups(base_lr=1e-3, stage2=True)
+    all_params2 = [p for g in groups2 for p in g['params']]
+    assert any(p is model.siglip_logit_scale for p in all_params2)
+    assert any(p is model.siglip_logit_bias for p in all_params2)
+
+
 def test_drop_path_rate_does_not_break_forward():
     """DropPath in the predictor should not change output shape or break training."""
     predictor = PredictorTransformer(
