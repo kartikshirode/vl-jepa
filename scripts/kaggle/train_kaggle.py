@@ -1,12 +1,17 @@
-"""Kaggle Notebooks entrypoint for VL-JEPA training on a single P100.
+"""Kaggle Notebooks entrypoint for VL-JEPA training on a single T4.
 
 This script is the `code_file` referenced by `kernel-metadata.json`. It runs
 inside the Kaggle kernel runtime and handles environment setup, dependency
 install, repo clone, and the training launch. It assumes the kernel has the
-`awsaf49/coco-2017-dataset` dataset attached and a GPU accelerator enabled.
+`awsaf49/coco-2017-dataset` dataset attached and a GPU accelerator enabled
+(use "GPU T4 x2" - the script only addresses the first T4).
+
+Why T4 and not P100: Kaggle's current PyTorch (>= 2.10) dropped support for
+Pascal (sm_60), so a P100 kernel fails to launch CUDA. T4 is Turing (sm_75)
+and supported.
 
 The local laptop config and code stay untouched; this script and the matching
-`configs/config_kaggle_p100.yaml` are the only Kaggle-specific surface.
+`configs/config_kaggle_t4.yaml` are the only Kaggle-specific surface.
 """
 
 import os
@@ -18,7 +23,7 @@ from pathlib import Path
 
 REPO_URL = "https://github.com/kartikshirode/vl-jepa.git"
 REPO_DIR = Path("/kaggle/working/vl-jepa")
-KAGGLE_CONFIG_REL = "configs/config_kaggle_p100.yaml"
+KAGGLE_CONFIG_REL = "configs/config_kaggle_t4.yaml"
 DATA_ROOT = Path("/kaggle/input/coco-2017-dataset/coco2017")
 
 # Silence noisy warnings before any imports that trigger them.
@@ -47,18 +52,19 @@ def check_gpu() -> None:
     if not torch.cuda.is_available():
         print(
             "ERROR: No CUDA device visible. Enable a GPU accelerator in the "
-            "kernel settings (Settings -> Accelerator -> GPU P100).",
+            "kernel settings (Settings -> Accelerator -> GPU T4 x2).",
             file=sys.stderr,
         )
         sys.exit(1)
     props = torch.cuda.get_device_properties(0)
     print(f"GPU: {props.name} | VRAM: {props.total_memory / 1024**3:.1f} GB")
     print(f"PyTorch: {torch.__version__} | CUDA: {torch.version.cuda}")
-    if "P100" not in props.name:
+    if "T4" not in props.name:
         print(
-            f"WARNING: expected an NVIDIA P100, got '{props.name}'. The "
-            f"config_kaggle_p100.yaml batch size and worker counts were sized "
-            f"for P100; other accelerators may need tuning."
+            f"WARNING: expected an NVIDIA T4, got '{props.name}'. The "
+            f"config_kaggle_t4.yaml batch size and worker counts were sized "
+            f"for T4 (16 GB, Turing sm_75). If this is a P100, training will "
+            f"crash because Kaggle's PyTorch dropped Pascal (sm_60) support."
         )
 
 

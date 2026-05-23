@@ -80,3 +80,10 @@ Thumbs.db
 # (kernel-metadata.template.json) instead so anyone cloning the repo can
 # fill in their own values.
 scripts/kaggle/kernel-metadata.json
+
+# Kaggle API tokens. NEVER commit these. The CLI reads them from
+# ~/.kaggle/kaggle.json; a stray copy anywhere under the repo would leak.
+kaggle.json
+**/kaggle.json
+# But the manifest template is the one file we DO want tracked here.
+!scripts/kaggle/kernel-metadata.template.json

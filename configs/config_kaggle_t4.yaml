@@ -1,16 +1,26 @@
-# VL-JEPA configuration for Kaggle Notebooks on a single P100 (16 GB).
+# VL-JEPA configuration for Kaggle Notebooks on a single T4 (16 GB).
+#
+# Why T4 and not P100: Kaggle's current PyTorch (>= 2.10) dropped Pascal
+# (sm_60) support, so a P100 kernel crashes immediately with "CUDA
+# capability sm_60 is not compatible with the current PyTorch installation".
+# T4 is Turing (sm_75) and is on the supported list. T4 also has Tensor
+# Cores, so fp16 matmuls are faster per flop than P100, which offsets T4's
+# lower memory bandwidth (320 GB/s vs P100's 732 GB/s) on this workload.
+# When picking the accelerator in the Kaggle Notebook web UI, choose
+# "GPU T4 x2" - this script only uses the first T4, so the second one sits
+# idle but no harm done.
 #
 # Differences vs config_dgpu.yaml (intentional, optimized for the Kaggle session):
 #   - data.data_root: points at the pre-mounted Kaggle COCO dataset.
 #   - training.checkpoint_dir: absolute /kaggle/working path so outputs are
 #     captured by the kernel-output mechanism.
-#   - training.batch_size: 32 (up from 16). P100's 16 GB fits this comfortably
+#   - training.batch_size: 32 (up from 16). T4's 16 GB fits this comfortably
 #     and removes the need for gradient accumulation.
 #   - training.gradient_accumulation_steps: 1 (down from 2). Effective batch
 #     remains 32, so the training trajectory matches the local laptop run for
 #     direct comparison.
 #   - training.num_epochs: 20 (down from 30). Kaggle Notebooks have a 12-hour
-#     session cap. P100 at ~25 min/epoch lands ~8.5 hours, comfortable margin.
+#     session cap. T4 at ~25-30 min/epoch lands ~8-10 hours, comfortable margin.
 #   - training.warmup_epochs: 2 (down from 3). ~10% of total, same ratio.
 #   - data.num_workers: 2. Kaggle gives 4 CPU cores; leave headroom for the
 #     main process and the I/O thread.

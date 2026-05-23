@@ -1,7 +1,8 @@
 # Kaggle Notebooks — VL-JEPA training ops guide
 
 This directory holds everything needed to run a full VL-JEPA pretraining job
-on a free Kaggle Notebook with a single P100 GPU. The local laptop config
+on a free Kaggle Notebook using one of the two T4 GPUs in the "T4 x2"
+accelerator slot. The local laptop config
 (`config_dgpu.yaml`) is untouched so you can compare runs head-to-head and
 debug the Kaggle setup independently.
 
@@ -77,7 +78,7 @@ The first push creates the kernel. Subsequent pushes push a new version with
 the latest `train_kaggle.py`. Kaggle prints the kernel URL on success.
 
 **On the first push only**, open the kernel URL in your browser and confirm
-the GPU accelerator is set to "GPU P100" (not "GPU T4 x2" or "None") under
+the GPU accelerator is set to "GPU T4 x2" (not "GPU P100" or "None") under
 Settings -> Accelerator. `kernel-metadata.json`'s `enable_gpu: true` enables
 a GPU but doesn't pick which one; that's a one-time click. Subsequent pushes
 remember the choice.
@@ -118,7 +119,7 @@ python train.py --config config_dgpu.yaml --resume kaggle_outputs/checkpoints/ch
 
 ## Expected timings
 
-P100 at the configured `batch_size: 32` is roughly 2-3x the local 4060 Laptop
+A single T4 at the configured `batch_size: 32` is roughly 1.5-2.5x the local 4060 Laptop
 on this workload. Rough estimates:
 
 | Step | Wall time |
