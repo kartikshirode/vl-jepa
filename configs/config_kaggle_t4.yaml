@@ -99,6 +99,12 @@ training:
 
   empty_cache_every: 250
   save_every: 2
+  # Each checkpoint is ~1.2 GB (fp32 model + AdamW state + EMA targets +
+  # scheduler). With save_every=2 and num_epochs=20 that is 10 saves = 12 GB,
+  # which fits in /kaggle/working (20 GB cap) but leaves little headroom. The
+  # resume mechanism only ever needs the most recent file, so keep 2 (latest +
+  # one safety) and prune the rest after each save. Drops disk usage to ~2.4 GB.
+  keep_last_n_checkpoints: 2
   checkpoint_dir: "/kaggle/working/checkpoints"
   resume_from: null
 

@@ -39,6 +39,52 @@ except ImportError:
     print("Warning: bitsandbytes not found. Using standard AdamW.")
 
 
+def _prune_old_checkpoints(checkpoint_dir, pattern: str, keep_last_n) -> None:
+    """Delete older per-epoch checkpoint files, keeping only the latest N.
+
+    Per-epoch checkpoints are ~1 GB each at our model size, so a 20-epoch run
+    with save_every=2 generates 12 GB of redundant state when the resume
+    mechanism only ever needs the most recent file. This function trims the
+    glob match in `checkpoint_dir` down to the highest `keep_last_n` epochs
+    by parsing the epoch number out of each filename.
+
+    No-op when keep_last_n is None or <= 0 (the default), so local runs
+    that do not set the config field keep the original "save everything"
+    behavior.
+
+    `best_model.pth` and `stage2_best.pth` are not matched by typical
+    epoch_* patterns and are left untouched.
+    """
+    if keep_last_n is None or keep_last_n <= 0:
+        return
+    import re
+    from pathlib import Path as _Path
+
+    ckpts = list(_Path(checkpoint_dir).glob(pattern))
+    if len(ckpts) <= keep_last_n:
+        return
+
+    epoch_re = re.compile(r"epoch_(\d+)\.pth$")
+
+    def _epoch_of(p):
+        m = epoch_re.search(p.name)
+        return int(m.group(1)) if m else -1
+
+    ckpts.sort(key=_epoch_of)
+    to_delete = ckpts[:-keep_last_n]
+    deleted = 0
+    for p in to_delete:
+        try:
+            p.unlink()
+            deleted += 1
+        except OSError:
+            # Best effort; if a file is locked we just leave it.
+            pass
+    if deleted:
+        print(f"Pruned {deleted} old checkpoint(s) from {checkpoint_dir}; "
+              f"keeping last {keep_last_n}.")
+
+
 def _worker_init(worker_id: int):
     """Seed numpy and Python random per worker so mask sampling is distinct.
 
@@ -770,6 +816,7 @@ def main():
                 best_metric = val_metrics['val_loss']
         
         # Save checkpoint
+        keep_last_n = config['training'].get('keep_last_n_checkpoints')
         if args.stage2:
             # Stage-2: Always save each epoch, mark best
             save_checkpoint(
@@ -783,6 +830,7 @@ def main():
                 save_path=checkpoint_dir / f"stage2_epoch_{epoch}.pth",
                 is_best=is_best,
             )
+            _prune_old_checkpoints(checkpoint_dir, "stage2_epoch_*.pth", keep_last_n)
             if is_best:
                 save_checkpoint(
                     model=model,
@@ -808,6 +856,7 @@ def main():
                     save_path=checkpoint_dir / f"checkpoint_epoch_{epoch}.pth",
                     is_best=is_best,
                 )
+                _prune_old_checkpoints(checkpoint_dir, "checkpoint_epoch_*.pth", keep_last_n)
     
     logger.info("Training completed!")
     if args.stage2:
