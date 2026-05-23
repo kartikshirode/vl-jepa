@@ -132,6 +132,18 @@ class VLJEPAModel(nn.Module):
         """Unfreeze the text encoder (for Stage-1 or fine-tuning)."""
         for param in self.text_encoder.parameters():
             param.requires_grad = True
+
+    def train(self, mode: bool = True):
+        """
+        Override train() so the EMA target encoders stay in eval mode.
+        requires_grad=False stops gradients, but it does NOT disable dropout
+        or stochastic depth. Without this override, drop_path inside the
+        target ViT produces noisy targets that hurt the JEPA signal.
+        """
+        super().train(mode)
+        self.target_vision_encoder.eval()
+        self.target_text_encoder.eval()
+        return self
     
     def get_trainable_parameters(self):
         """
@@ -205,53 +217,73 @@ class VLJEPAModel(nn.Module):
         ):
             param_k.data = param_k.data * self.ema_momentum + param_q.data * (1.0 - self.ema_momentum)
     
+    def _gather_target_patches(
+        self,
+        target_full: torch.Tensor,
+        target_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Slice target encoder output to just the target patch positions."""
+        num_prefix = getattr(self.vision_encoder, 'num_prefix_tokens', 1)
+        patch_tokens = target_full[:, num_prefix:, :]  # [B, num_patches, D]
+        B, N_tgt = target_indices.shape
+        D = patch_tokens.shape[-1]
+        idx = target_indices.unsqueeze(-1).expand(B, N_tgt, D)
+        return torch.gather(patch_tokens, dim=1, index=idx)
+
     def forward_jepa(
         self,
         images: torch.Tensor,
-        text_input_ids: torch.Tensor,
-        text_attention_mask: torch.Tensor,
+        text_input_ids: Optional[torch.Tensor] = None,
+        text_attention_mask: Optional[torch.Tensor] = None,
+        context_indices: Optional[torch.Tensor] = None,
+        target_indices: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
         target_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass for JEPA training.
-        
+        I-JEPA forward pass.
+
+        The context encoder sees ONLY the visible context patches (indexed by
+        context_indices). The target encoder runs on the full image and we
+        gather just the target patch positions. The predictor takes the
+        context tokens and produces predictions at the target positions.
+
         Args:
-            images: Input images [B, 3, H, W]
-            text_input_ids: Text token IDs [B, L]
-            text_attention_mask: Text attention mask [B, L]
-            context_mask: Boolean mask for context (visible) patches [B, N] (True = visible)
-            target_mask: Boolean mask for target (to predict) patches [B, N] (True = target)
-            
+            images: [B, 3, H, W]
+            text_input_ids / text_attention_mask: unused in pure JEPA mode,
+                accepted for signature compatibility.
+            context_indices: [B, N_ctx] grid indices of visible patches.
+            target_indices: [B, N_tgt] grid indices to predict.
+            context_mask / target_mask: optional boolean masks for downstream
+                visualization; not used by the loss.
+
         Returns:
-            Dictionary with predictions and targets
+            Dict with predicted_vision, target_vision (both [B, N_tgt, D]).
         """
-        B = images.shape[0]
-        
-        # Encode all vision tokens (we'll mask in loss computation)
-        context_vision = self.vision_encoder(images, return_all_tokens=True)  # [B, N+1, D_v]
-        
-        # Encode text for cross-modal context
-        context_text = self.text_encoder(
-            text_input_ids, 
-            text_attention_mask, 
-            return_all_tokens=True,
-            return_projected=False
-        )  # [B, L, D_t]
-        
-        # Predict target representations from context
-        # The predictor learns to predict masked regions from visible context
-        predicted_vision = self.predictor(context_vision)  # [B, N+1, D_v]
-        
-        # Encode targets with target encoder (EMA, no gradients)
+        if context_indices is None or target_indices is None:
+            raise ValueError("forward_jepa requires context_indices and target_indices.")
+
+        # Context encoder sees only visible patches.
+        context_repr = self.vision_encoder.forward_context(images, context_indices)
+        assert context_repr.shape[1] == context_indices.shape[1], (
+            f"Context encoder returned {context_repr.shape[1]} tokens for "
+            f"{context_indices.shape[1]} context indices."
+        )
+
+        # Predict at target positions using context and 2D positional info.
+        predicted_vision = self.predictor(context_repr, context_indices, target_indices)
+
+        # Target encoder runs on the full image (no grad), then gather targets.
         with torch.no_grad():
-            target_vision = self.target_vision_encoder(images, return_all_tokens=True)  # [B, N+1, D_v]
-        
+            target_full = self.target_vision_encoder(images, return_all_tokens=True)
+            target_vision = self._gather_target_patches(target_full, target_indices)
+
         return {
             'predicted_vision': predicted_vision,
             'target_vision': target_vision.detach(),
-            'context_vision': context_vision,
-            'context_text': context_text,
+            'context_repr': context_repr,
+            'context_indices': context_indices,
+            'target_indices': target_indices,
             'context_mask': context_mask,
             'target_mask': target_mask,
         }
@@ -302,50 +334,22 @@ class VLJEPAModel(nn.Module):
         self,
         predicted: torch.Tensor,
         target: torch.Tensor,
-        target_mask: Optional[torch.Tensor] = None,
+        target_mask: Optional[torch.Tensor] = None,  # unused, kept for back-compat
     ) -> torch.Tensor:
         """
-        Compute JEPA loss (smooth L1 loss in representation space).
-        
-        JEPA computes loss ONLY on target (masked) patches, not visible ones.
-        
-        Args:
-            predicted: Predicted representations [B, N+1, D]
-            target: Target representations [B, N+1, D]
-            target_mask: Boolean mask for target patches [B, N] (True = compute loss)
-            
-        Returns:
-            Loss value
+        Smooth L1 loss between predicted and target representations.
+
+        Both `predicted` and `target` are already aligned to the target
+        positions (shape [B, N_tgt, D]); no CLS slicing, no mask broadcasting.
+
+        Per I-JEPA: layer-norm the target side only, not the predicted side.
+        Normalizing both dampens gradients.
         """
-        # Skip CLS token (first token) for JEPA loss - only compute on patch tokens
-        # predicted and target are [B, N+1, D] where N+1 = 197 (1 CLS + 196 patches)
-        predicted_patches = predicted[:, 1:, :]  # [B, N, D] = [B, 196, D]
-        target_patches = target[:, 1:, :]  # [B, N, D] = [B, 196, D]
-        
-        # Normalize (helps stability, following I-JEPA)
-        predicted_patches = F.layer_norm(predicted_patches, predicted_patches.shape[-1:])
-        target_patches = F.layer_norm(target_patches, target_patches.shape[-1:])
-        
-        # Compute smooth L1 loss (more robust than MSE)
-        loss = F.smooth_l1_loss(predicted_patches, target_patches, reduction='none')  # [B, N, D]
-        
-        # Average over feature dimension
-        loss = loss.mean(dim=-1)  # [B, N]
-        
-        # Apply target mask - only compute loss on target (masked) patches
-        if target_mask is not None:
-            # target_mask: [B, N] where True indicates target patches
-            if target_mask.dim() == 1:
-                target_mask = target_mask.unsqueeze(0).expand(loss.shape[0], -1)
-            # Only compute loss on target patches
-            loss = loss * target_mask.float()
-            num_targets = target_mask.sum() + 1e-8
-            loss = loss.sum() / num_targets
-        else:
-            # If no mask, compute loss on all patches (not ideal but fallback)
-            loss = loss.mean()
-        
-        return loss
+        assert predicted.shape == target.shape, (
+            f"predicted {tuple(predicted.shape)} vs target {tuple(target.shape)}"
+        )
+        target = F.layer_norm(target, target.shape[-1:])
+        return F.smooth_l1_loss(predicted, target.detach(), reduction='mean')
     
     def compute_contrastive_loss(
         self,
@@ -380,115 +384,84 @@ class VLJEPAModel(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
-        text_input_ids: torch.Tensor,
-        text_attention_mask: torch.Tensor,
+        text_input_ids: Optional[torch.Tensor] = None,
+        text_attention_mask: Optional[torch.Tensor] = None,
+        context_indices: Optional[torch.Tensor] = None,
+        target_indices: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
         target_mask: Optional[torch.Tensor] = None,
         mode: str = "jepa",
     ) -> Dict[str, torch.Tensor]:
         """
-        Forward pass with specified mode.
-        
         Args:
-            images: Input images [B, 3, H, W]
-            text_input_ids: Text token IDs [B, L]
-            text_attention_mask: Text attention mask [B, L]
-            context_mask: Context (visible) patch mask [B, N] - True = visible
-            target_mask: Target (to predict) patch mask [B, N] - True = target
-            mode: Forward mode ("jepa", "contrastive", or "both")
-            
-        Returns:
-            Dictionary with outputs and losses
+            images: [B, 3, H, W]
+            text_input_ids / text_attention_mask: required for contrastive and both.
+            context_indices / target_indices: required for jepa and both.
+            context_mask / target_mask: optional, for visualization only.
+            mode: "jepa", "contrastive", or "both".
         """
         if mode == "jepa":
             outputs = self.forward_jepa(
-                images, text_input_ids, text_attention_mask, 
-                context_mask, target_mask
+                images=images,
+                context_indices=context_indices,
+                target_indices=target_indices,
+                context_mask=context_mask,
+                target_mask=target_mask,
             )
-            
-            # Compute JEPA loss only on target patches
             jepa_loss = self.compute_jepa_loss(
                 outputs['predicted_vision'],
                 outputs['target_vision'],
-                target_mask=target_mask,
             )
-            
             outputs['jepa_loss'] = jepa_loss
             outputs['loss'] = jepa_loss
-            
+
         elif mode == "contrastive":
             outputs = self.forward_contrastive(images, text_input_ids, text_attention_mask)
-            
-            # Compute contrastive loss
             contrastive_loss = self.compute_contrastive_loss(
                 outputs['vision_embed'],
                 outputs['text_embed'],
             )
-            
             outputs['contrastive_loss'] = contrastive_loss
             outputs['loss'] = contrastive_loss
-            
+
         elif mode == "both":
-            # Combined mode: JEPA + contrastive (optimized to avoid double encoding)
-            B = images.shape[0]
-            
-            # Encode vision ONCE - get all tokens for JEPA
-            context_vision = self.vision_encoder(images, return_all_tokens=True)  # [B, N+1, D_v]
-            
-            # Encode text ONCE
-            context_text = self.text_encoder(
-                text_input_ids, 
-                text_attention_mask, 
-                return_all_tokens=True,
-                return_projected=False
-            )  # [B, L, D_t]
-            
-            # JEPA: Predict target representations
-            predicted_vision = self.predictor(context_vision)  # [B, N+1, D_v]
-            
-            # JEPA: Get target from EMA encoder
-            with torch.no_grad():
-                target_vision = self.target_vision_encoder(images, return_all_tokens=True)
-            
-            # Compute JEPA loss
-            jepa_loss = self.compute_jepa_loss(
-                predicted_vision,
-                target_vision.detach(),
+            # JEPA path: context encoder sees only visible patches.
+            jepa_out = self.forward_jepa(
+                images=images,
+                context_indices=context_indices,
+                target_indices=target_indices,
+                context_mask=context_mask,
                 target_mask=target_mask,
             )
-            
-            # Contrastive: Reuse CLS tokens from already-encoded features
-            vision_cls = context_vision[:, 0, :]  # [B, D_v] - CLS token
-            text_cls = context_text[:, 0, :]  # [B, D_t] - CLS token
-            
-            # Project to shared embedding space
-            vision_embed = self.vision_projection(vision_cls)  # [B, embedding_dim]
-            text_embed = self.text_projection(text_cls)  # [B, embedding_dim]
-            
-            # Normalize
-            vision_embed = F.normalize(vision_embed, dim=-1)
-            text_embed = F.normalize(text_embed, dim=-1)
-            
-            # Compute contrastive loss
-            contrastive_loss = self.compute_contrastive_loss(vision_embed, text_embed)
-            
+            jepa_loss = self.compute_jepa_loss(
+                jepa_out['predicted_vision'],
+                jepa_out['target_vision'],
+            )
+
+            # Contrastive path: run a separate CLS-only forward over the full
+            # image. Reusing the masked context_repr for contrastive would
+            # change retrieval semantics (mean-of-context vs CLS), so we accept
+            # the extra encoder pass to keep contrastive identical to the
+            # standalone forward_contrastive path.
+            contrastive_out = self.forward_contrastive(images, text_input_ids, text_attention_mask)
+            contrastive_loss = self.compute_contrastive_loss(
+                contrastive_out['vision_embed'],
+                contrastive_out['text_embed'],
+            )
+
             outputs = {
-                'predicted_vision': predicted_vision,
-                'target_vision': target_vision.detach(),
-                'context_vision': context_vision,
-                'context_text': context_text,
-                'context_mask': context_mask,
-                'target_mask': target_mask,
-                'vision_embed': vision_embed,
-                'text_embed': text_embed,
+                **jepa_out,
+                'vision_embed': contrastive_out['vision_embed'],
+                'text_embed': contrastive_out['text_embed'],
+                'jepa_loss': jepa_loss,
+                'contrastive_loss': contrastive_loss,
             }
-            outputs['jepa_loss'] = jepa_loss
-            outputs['contrastive_loss'] = contrastive_loss
-            outputs['loss'] = jepa_loss + 0.5 * contrastive_loss  # Weighted combination
-        
+            # The trainer recomputes the combined loss from config weights;
+            # don't add a dead outputs['loss'] here.
+
         else:
             raise ValueError(f"Unknown mode: {mode}")
-        
+
         return outputs
 
 
@@ -510,8 +483,8 @@ def create_vl_jepa_model(config: dict) -> VLJEPAModel:
     vision_encoder = create_vision_encoder(config['model'])
     text_encoder = create_text_encoder(config['model'])
     
-    # Create predictor
-    predictor_type = config['model']['predictor'].get('type', 'mlp')
+    # Create predictor (default: transformer with 2D positional embeddings)
+    predictor_type = config['model']['predictor'].get('type', 'transformer')
     predictor = create_predictor(config['model'], predictor_type=predictor_type)
     
     # Create model
@@ -568,17 +541,18 @@ if __name__ == "__main__":
     images = torch.randn(2, 3, 224, 224)
     text_input_ids = torch.randint(0, 1000, (2, 128))
     text_attention_mask = torch.ones(2, 128)
-    context_mask = torch.rand(2, 196) > 0.15  # Context: ~85% visible
-    target_mask = torch.rand(2, 196) > 0.80   # Target: ~20% to predict
-    
+    # Fixed sizes per batch, like the real mask generator returns.
+    context_indices = torch.stack([torch.randperm(196)[:80] for _ in range(2)])
+    target_indices = torch.stack([torch.randperm(196)[:40] for _ in range(2)])
+
     # Test JEPA mode
     with torch.no_grad():
         outputs = model(
             images=images,
             text_input_ids=text_input_ids,
             text_attention_mask=text_attention_mask,
-            context_mask=context_mask,
-            target_mask=target_mask,
+            context_indices=context_indices,
+            target_indices=target_indices,
             mode="jepa",
         )
         print(f"JEPA loss: {outputs['loss'].item():.4f}")

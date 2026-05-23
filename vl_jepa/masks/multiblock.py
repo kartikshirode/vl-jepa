@@ -1,34 +1,37 @@
 """
-Multi-block masking strategy for JEPA
-Based on I-JEPA paper masking approach
+Multi-block masking strategy for JEPA.
+
+Follows the I-JEPA recipe:
+  - Sample one rectangular context block at `context_scale`.
+  - Sample several rectangular target blocks at `target_scale`.
+  - Remove any patch that landed in a target from the context, so the context
+    encoder genuinely never sees what it's being asked to predict.
+
+The generator returns both boolean masks (for visualization) and 1D index
+tensors with FIXED N_ctx and N_tgt across the batch (padded by random
+sampling from the eligible pool when blocks come out short). Fixed counts
+make collation easy: no padding logic in the model.
 """
 
 import torch
 import numpy as np
-from typing import Tuple, List, Optional
+from dataclasses import dataclass
+from typing import Tuple, Optional
 import random
 
 
+@dataclass
+class MaskSample:
+    """One sample's worth of masks plus their flattened indices."""
+    context_mask: torch.Tensor   # bool [num_patches]
+    target_mask: torch.Tensor    # bool [num_patches]
+    context_indices: torch.Tensor  # long [N_ctx]
+    target_indices: torch.Tensor   # long [N_tgt]
+
+
 class MultiBlockMaskGenerator:
-    """
-    Generate context and target block masks for JEPA training.
-    
-    Context blocks: Large blocks of visible patches (what the model sees)
-    Target blocks: Smaller blocks to predict (what the model predicts)
-    
-    Args:
-        input_size: Input image size (e.g., 224)
-        patch_size: Size of each patch (e.g., 16)
-        num_context_blocks: Number of context blocks (typically 1)
-        num_target_blocks: Number of target blocks (typically 4)
-        context_scale: Scale range for context blocks (e.g., [0.85, 1.0])
-        target_scale: Scale range for target blocks (e.g., [0.15, 0.2])
-        context_aspect_ratio: Aspect ratio range for context blocks
-        target_aspect_ratio: Aspect ratio range for target blocks
-        allow_overlap: Whether target blocks can overlap with context
-        min_keep: Minimum number of patches to keep visible
-    """
-    
+    """Multi-block I-JEPA mask sampler with fixed output sizes."""
+
     def __init__(
         self,
         input_size: int = 224,
@@ -41,220 +44,201 @@ class MultiBlockMaskGenerator:
         target_aspect_ratio: Tuple[float, float] = (0.75, 1.5),
         allow_overlap: bool = False,
         min_keep: int = 10,
+        max_tries: int = 20,
     ):
         self.input_size = input_size
         self.patch_size = patch_size
         self.num_patches = (input_size // patch_size)
         self.total_patches = self.num_patches ** 2
-        
+
         self.num_context_blocks = num_context_blocks
         self.num_target_blocks = num_target_blocks
-        
         self.context_scale = context_scale
         self.target_scale = target_scale
-        
         self.context_aspect_ratio = context_aspect_ratio
         self.target_aspect_ratio = target_aspect_ratio
-        
         self.allow_overlap = allow_overlap
         self.min_keep = min_keep
-    
+        self.max_tries = max_tries
+
+        # Fix per-sample sizes for batchability. Use the midpoint of each
+        # scale range times the patch count, with a floor so we always have
+        # something to predict.
+        mean_ctx_scale = 0.5 * (context_scale[0] + context_scale[1])
+        mean_tgt_scale = 0.5 * (target_scale[0] + target_scale[1])
+        # Total target coverage across all blocks (before deduping overlap).
+        target_total = mean_tgt_scale * num_target_blocks
+        # Context block area, with the targets carved out.
+        ctx_after_carve = max(mean_ctx_scale - target_total, 0.2)
+
+        self.n_target_fixed = max(int(round(target_total * self.total_patches)), 1)
+        self.n_context_fixed = max(int(round(ctx_after_carve * self.total_patches)), min_keep)
+
+        # Cap to physical limits.
+        self.n_target_fixed = min(self.n_target_fixed, self.total_patches - min_keep)
+        self.n_context_fixed = min(self.n_context_fixed, self.total_patches - self.n_target_fixed)
+
+    # ----- block geometry helpers -----
+
     def _sample_block_size(
         self,
         scale: Tuple[float, float],
         aspect_ratio: Tuple[float, float],
     ) -> Tuple[int, int]:
-        """
-        Sample block size (height, width) in terms of patches.
-        
-        Args:
-            scale: Scale range [min, max] relative to image
-            aspect_ratio: Aspect ratio range [min, max]
-            
-        Returns:
-            (height, width) in number of patches
-        """
-        # Sample scale and aspect ratio
         _scale = random.uniform(scale[0], scale[1])
-        _aspect_ratio = random.uniform(aspect_ratio[0], aspect_ratio[1])
-        
-        # Calculate area in patches
-        area = int(_scale * self.total_patches)
-        
-        # Calculate height and width maintaining aspect ratio
-        h = int(round(np.sqrt(area / _aspect_ratio)))
-        w = int(round(np.sqrt(area * _aspect_ratio)))
-        
-        # Clip to valid range
+        _ar = random.uniform(aspect_ratio[0], aspect_ratio[1])
+        area = max(int(_scale * self.total_patches), 1)
+        h = int(round(np.sqrt(area / _ar)))
+        w = int(round(np.sqrt(area * _ar)))
         h = min(max(h, 1), self.num_patches)
         w = min(max(w, 1), self.num_patches)
-        
         return h, w
-    
+
     def _sample_block_position(
         self,
         block_h: int,
         block_w: int,
-        occupied_mask: Optional[np.ndarray] = None,
+        occupied: Optional[np.ndarray] = None,
     ) -> Optional[Tuple[int, int]]:
-        """
-        Sample top-left position for a block.
-        
-        Args:
-            block_h: Block height in patches
-            block_w: Block width in patches
-            occupied_mask: Mask of already occupied patches [H, W]
-            
-        Returns:
-            (top, left) position or None if no valid position
-        """
-        # Valid range for top-left corner
         max_top = self.num_patches - block_h
         max_left = self.num_patches - block_w
-        
         if max_top < 0 or max_left < 0:
             return None
-        
-        # Try to find valid position
-        max_attempts = 100
-        for _ in range(max_attempts):
+        for _ in range(100):
             top = random.randint(0, max_top)
             left = random.randint(0, max_left)
-            
-            # Check if position overlaps with occupied regions
-            if occupied_mask is not None and not self.allow_overlap:
-                block_region = occupied_mask[top:top+block_h, left:left+block_w]
-                if block_region.any():
-                    continue  # Overlap detected, try again
-            
+            if occupied is not None and not self.allow_overlap:
+                if occupied[top:top + block_h, left:left + block_w].any():
+                    continue
             return top, left
-        
-        # Could not find valid position
         return None
-    
-    def _create_block_mask(
-        self,
-        blocks: List[Tuple[int, int, int, int]],
-    ) -> np.ndarray:
-        """
-        Create binary mask from block definitions.
-        
-        Args:
-            blocks: List of (top, left, height, width) tuples
-            
-        Returns:
-            Binary mask [H, W] where 1 = visible/target, 0 = masked
-        """
-        mask = np.zeros((self.num_patches, self.num_patches), dtype=bool)
-        
-        for top, left, h, w in blocks:
-            mask[top:top+h, left:left+w] = True
-        
-        return mask
-    
-    def __call__(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Generate context and target masks.
-        
-        Following I-JEPA/VL-JEPA strategy:
-        - First generate target blocks (what to predict)
-        - Context is everything EXCEPT targets (what model sees)
-        
-        Returns:
-            context_mask: Boolean mask for context (visible) patches [N] - True = visible
-            target_mask: Boolean mask for target (predict) patches [N] - True = predict
-        """
-        # Storage for blocks
-        target_blocks = []
-        
-        # Generate target blocks FIRST (what we want to predict)
-        occupied_mask = np.zeros((self.num_patches, self.num_patches), dtype=bool)
-        
+
+    def _try_sample(self) -> Optional[MaskSample]:
+        """One attempt. Returns None if it can't satisfy constraints."""
+        # Sample target blocks first.
+        target_grid = np.zeros((self.num_patches, self.num_patches), dtype=bool)
         for _ in range(self.num_target_blocks):
             h, w = self._sample_block_size(self.target_scale, self.target_aspect_ratio)
-            pos = self._sample_block_position(h, w, occupied_mask if not self.allow_overlap else None)
-            
-            if pos is not None:
-                top, left = pos
-                target_blocks.append((top, left, h, w))
-                occupied_mask[top:top+h, left:left+w] = True
-        
-        # Create target mask
-        target_mask = self._create_block_mask(target_blocks)
-        
-        # Context mask is the INVERSE of target mask (visible = not masked)
-        # In JEPA: context sees everything except targets
-        context_mask = ~target_mask
-        
-        # Flatten to 1D
-        context_mask = context_mask.flatten()  # [H*W]
-        target_mask = target_mask.flatten()  # [H*W]
-        
-        # Ensure minimum patches are visible in context
-        if context_mask.sum() < self.min_keep:
-            # Randomly select additional patches from targets to show
-            n_additional = self.min_keep - context_mask.sum()
-            target_indices = np.where(target_mask)[0]
-            if len(target_indices) > 0:
-                to_show = np.random.choice(target_indices, size=min(n_additional, len(target_indices)), replace=False)
-                context_mask[to_show] = True
-                target_mask[to_show] = False  # Remove from targets
-        
-        # Convert to torch tensors
-        context_mask = torch.from_numpy(context_mask)
-        target_mask = torch.from_numpy(target_mask)
-        
-        return context_mask, target_mask
-    
+            pos = self._sample_block_position(h, w, target_grid if not self.allow_overlap else None)
+            if pos is None:
+                continue
+            top, left = pos
+            target_grid[top:top + h, left:left + w] = True
+
+        # Sample one context block at context_scale (per I-JEPA), then carve out targets.
+        context_grid = np.zeros((self.num_patches, self.num_patches), dtype=bool)
+        for _ in range(self.num_context_blocks):
+            h, w = self._sample_block_size(self.context_scale, self.context_aspect_ratio)
+            pos = self._sample_block_position(h, w, None)  # context blocks can overlap each other
+            if pos is None:
+                continue
+            top, left = pos
+            context_grid[top:top + h, left:left + w] = True
+
+        # Carve targets out of context (this is the core JEPA invariant).
+        context_grid = context_grid & ~target_grid
+
+        ctx_flat = context_grid.flatten()
+        tgt_flat = target_grid.flatten()
+
+        n_ctx_avail = int(ctx_flat.sum())
+        n_tgt_avail = int(tgt_flat.sum())
+
+        if n_tgt_avail == 0 or n_ctx_avail < self.min_keep:
+            return None
+
+        # Pad / trim to fixed sizes.
+        target_indices = np.where(tgt_flat)[0]
+        context_indices = np.where(ctx_flat)[0]
+
+        # Trim or expand target indices.
+        if len(target_indices) >= self.n_target_fixed:
+            target_indices = np.random.choice(target_indices, size=self.n_target_fixed, replace=False)
+        else:
+            # Pad from patches that are neither in current context nor target.
+            outside = np.where(~ctx_flat & ~tgt_flat)[0]
+            need = self.n_target_fixed - len(target_indices)
+            if len(outside) < need:
+                # Last-ditch: take from context too, but only if we don't break min_keep.
+                spare = len(context_indices) - self.min_keep
+                if spare < need - len(outside):
+                    return None
+                extra_from_ctx = np.random.choice(context_indices, size=need - len(outside), replace=False)
+                target_indices = np.concatenate([target_indices, outside, extra_from_ctx])
+                context_indices = np.setdiff1d(context_indices, extra_from_ctx, assume_unique=False)
+            else:
+                pick = np.random.choice(outside, size=need, replace=False)
+                target_indices = np.concatenate([target_indices, pick])
+
+        # Trim or expand context indices.
+        if len(context_indices) >= self.n_context_fixed:
+            context_indices = np.random.choice(context_indices, size=self.n_context_fixed, replace=False)
+        else:
+            outside = np.setdiff1d(
+                np.arange(self.total_patches),
+                np.concatenate([context_indices, target_indices]),
+                assume_unique=False,
+            )
+            need = self.n_context_fixed - len(context_indices)
+            if len(outside) < need:
+                return None
+            pick = np.random.choice(outside, size=need, replace=False)
+            context_indices = np.concatenate([context_indices, pick])
+
+        # Rebuild canonical boolean masks from the final index sets.
+        final_ctx_mask = np.zeros(self.total_patches, dtype=bool)
+        final_tgt_mask = np.zeros(self.total_patches, dtype=bool)
+        final_ctx_mask[context_indices] = True
+        final_tgt_mask[target_indices] = True
+
+        return MaskSample(
+            context_mask=torch.from_numpy(final_ctx_mask),
+            target_mask=torch.from_numpy(final_tgt_mask),
+            context_indices=torch.from_numpy(np.sort(context_indices)).long(),
+            target_indices=torch.from_numpy(np.sort(target_indices)).long(),
+        )
+
+    def sample(self) -> MaskSample:
+        """Sample a valid mask, retrying up to `max_tries` times."""
+        for _ in range(self.max_tries):
+            out = self._try_sample()
+            if out is not None:
+                return out
+        raise RuntimeError(
+            f"MultiBlockMaskGenerator could not satisfy constraints after "
+            f"{self.max_tries} tries. Check context_scale / target_scale / "
+            f"num_target_blocks / min_keep settings."
+        )
+
+    def __call__(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Backwards-friendly call: returns 4-tuple of (ctx_mask, tgt_mask, ctx_idx, tgt_idx)."""
+        s = self.sample()
+        return s.context_mask, s.target_mask, s.context_indices, s.target_indices
+
     def visualize_masks(
         self,
         context_mask: torch.Tensor,
         target_mask: torch.Tensor,
     ) -> np.ndarray:
-        """
-        Create visualization of masks.
-        
-        Args:
-            context_mask: Context mask [N]
-            target_mask: Target mask [N]
-            
-        Returns:
-            Visualization array [H, W] where:
-                0 = masked (neither context nor target)
-                1 = context (visible)
-                2 = target (to predict)
-                3 = overlap (both context and target)
-        """
+        """Render a [H, W] int array (0 masked, 1 context, 2 target, 3 overlap)."""
         H = W = self.num_patches
-        
         vis = np.zeros((H, W), dtype=np.int32)
-        
         context_2d = context_mask.reshape(H, W).numpy()
         target_2d = target_mask.reshape(H, W).numpy()
-        
         vis[context_2d] = 1
         vis[target_2d] = 2
         vis[context_2d & target_2d] = 3
-        
         return vis
 
 
 def create_mask_generator(config: dict) -> MultiBlockMaskGenerator:
-    """
-    Factory function to create mask generator from config.
-    
-    Args:
-        config: Configuration dictionary
-        
-    Returns:
-        MultiBlockMaskGenerator instance
-    """
+    """Build a MultiBlockMaskGenerator from a config dict."""
     mask_config = config.get('masking', {})
     vision_config = config.get('vision_encoder', {})
-    
+
     input_size = vision_config.get('image_size', 224)
     patch_size = vision_config.get('patch_size', 16)
-    
+
     return MultiBlockMaskGenerator(
         input_size=input_size,
         patch_size=patch_size,
@@ -271,8 +255,6 @@ def create_mask_generator(config: dict) -> MultiBlockMaskGenerator:
 
 if __name__ == "__main__":
     print("Testing MultiBlockMaskGenerator...")
-    
-    # Create mask generator
     mask_gen = MultiBlockMaskGenerator(
         input_size=224,
         patch_size=16,
@@ -282,36 +264,22 @@ if __name__ == "__main__":
         target_scale=(0.15, 0.2),
         allow_overlap=False,
     )
-    
-    # Generate masks
-    context_mask, target_mask = mask_gen()
-    
-    print(f"Context mask shape: {context_mask.shape}")
-    print(f"Target mask shape: {target_mask.shape}")
-    print(f"Context patches: {context_mask.sum().item()} / {mask_gen.total_patches}")
-    print(f"Target patches: {target_mask.sum().item()} / {mask_gen.total_patches}")
-    print(f"Overlap patches: {(context_mask & target_mask).sum().item()}")
-    
-    # Visualize
-    vis = mask_gen.visualize_masks(context_mask, target_mask)
-    print(f"Visualization shape: {vis.shape}")
-    print(f"Unique values: {np.unique(vis)}")
-    
-    # Test batch generation
-    print("\nTesting batch generation...")
-    batch_size = 4
-    context_masks = []
-    target_masks = []
-    
-    for _ in range(batch_size):
-        ctx, tgt = mask_gen()
-        context_masks.append(ctx)
-        target_masks.append(tgt)
-    
-    context_batch = torch.stack(context_masks)
-    target_batch = torch.stack(target_masks)
-    
-    print(f"Context batch shape: {context_batch.shape}")
-    print(f"Target batch shape: {target_batch.shape}")
-    
-    print("\nMask generator test passed!")
+    ctx_mask, tgt_mask, ctx_idx, tgt_idx = mask_gen()
+    print(f"Context mask shape: {ctx_mask.shape}")
+    print(f"Target mask shape: {tgt_mask.shape}")
+    print(f"Context patches: {ctx_mask.sum().item()} / {mask_gen.total_patches}")
+    print(f"Target patches: {tgt_mask.sum().item()} / {mask_gen.total_patches}")
+    print(f"Disjoint (no overlap): {(ctx_mask & tgt_mask).sum().item() == 0}")
+    print(f"Context indices shape: {ctx_idx.shape}")
+    print(f"Target indices shape: {tgt_idx.shape}")
+    print(f"Fixed N_ctx = {mask_gen.n_context_fixed}, N_tgt = {mask_gen.n_target_fixed}")
+
+    # Same sizes across a batch?
+    print("\nBatch consistency check...")
+    sizes = set()
+    for _ in range(16):
+        _, _, ci, ti = mask_gen()
+        sizes.add((ci.shape[0], ti.shape[0]))
+    print(f"Distinct (N_ctx, N_tgt) shapes across 16 samples: {sizes}")
+    assert len(sizes) == 1, "Mask sizes drifted across samples; collation will break."
+    print("Mask generator test passed!")

@@ -183,16 +183,16 @@ def train_one_epoch(
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
 
-        # Generate masks (context = visible, target = to predict)
-        context_masks = []
-        target_masks = []
+        # Generate per-sample mask indices and stack into batched tensors.
+        ctx_masks, tgt_masks, ctx_idxs, tgt_idxs = [], [], [], []
         for _ in range(images.shape[0]):
-            ctx_mask, tgt_mask = mask_generator()
-            context_masks.append(ctx_mask)
-            target_masks.append(tgt_mask)
-
-        context_mask = torch.stack(context_masks).to(device)
-        target_mask = torch.stack(target_masks).to(device)
+            cm, tm, ci, ti = mask_generator()
+            ctx_masks.append(cm); tgt_masks.append(tm)
+            ctx_idxs.append(ci); tgt_idxs.append(ti)
+        context_mask = torch.stack(ctx_masks).to(device)
+        target_mask = torch.stack(tgt_masks).to(device)
+        context_indices = torch.stack(ctx_idxs).to(device)
+        target_indices = torch.stack(tgt_idxs).to(device)
 
         # Forward pass with mixed precision (no-op on CPU)
         with autocast(device_type=device, enabled=use_amp):
@@ -200,6 +200,8 @@ def train_one_epoch(
                 images=images,
                 text_input_ids=input_ids,
                 text_attention_mask=attention_mask,
+                context_indices=context_indices,
+                target_indices=target_indices,
                 context_mask=context_mask,
                 target_mask=target_mask,
                 mode="both",

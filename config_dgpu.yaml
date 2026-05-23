@@ -26,13 +26,14 @@ model:
     gradient_checkpointing: false  # Disable for DGPU
   
   predictor:
-    type: "mlp"  # Options: "mlp", "transformer"
-    input_dim: 192  # Match vision encoder
-    hidden_dim: 384  # Larger hidden dim for DGPU
+    type: "transformer"  # Options: "transformer" (default), "mlp" (ablation only), "cross_attention"
+    input_dim: 192       # Match vision encoder
+    hidden_dim: 384      # Predictor working width
     output_dim: 192
-    num_layers: 4   # Deeper predictor
-    dropout: 0.1
-    use_layer_norm: true
+    num_layers: 6        # I-JEPA-style narrow transformer depth
+    num_heads: 6
+    mlp_ratio: 4.0
+    dropout: 0.0
   
   embedding_dim: 256  # Shared embedding space for contrastive learning
   temperature: 0.07  # For contrastive loss
