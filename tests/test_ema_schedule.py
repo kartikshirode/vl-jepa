@@ -4,11 +4,19 @@ and in-place EMA update doesn't allocate new tensors.
 """
 
 import math
+import sys
+from pathlib import Path
+
 import torch
 import pytest
 
 from vl_jepa.models import VisionEncoder, TextEncoder, VLJEPAModel
 from vl_jepa.models.predictor import PredictorTransformer
+
+# train.py lives at the repo root, alongside the package. Add it so we can
+# import its create_scheduler helper from the test.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from train import create_scheduler  # noqa: E402
 
 
 def _build_tiny_model():
@@ -84,3 +92,49 @@ def test_ema_progress_uses_optimizer_steps_not_microbatches():
             global_step += 1
     progress = min(1.0, global_step / max(1, total_optimizer_steps))
     assert progress == 1.0, f"end-of-training progress should be 1.0, got {progress}"
+
+
+def test_scheduler_tmax_matches_optimizer_step_horizon():
+    """
+    Lock in the ISSUE-1 fix: create_scheduler must size CosineAnnealingLR's
+    T_max in OPTIMIZER STEPS post-warmup, not in micro-batches. We rebuild
+    the same arithmetic the trainer uses and assert agreement.
+
+    If a future refactor passes raw len(dataloader) into create_scheduler
+    again, T_max ends up grad_accum_steps times too large and the LR never
+    finishes annealing during a real run.
+    """
+    # Cheap dummy optimizer so we don't load the real model.
+    params = [torch.nn.Parameter(torch.randn(2))]
+    optimizer = torch.optim.AdamW(params, lr=3e-4)
+
+    grad_accum_steps = 4
+    micro_batches_per_epoch = 17  # deliberately not a multiple of grad_accum
+    num_epochs = 3
+    warmup_epochs = 1
+
+    cfg = {
+        'training': {
+            'num_epochs': num_epochs,
+            'warmup_epochs': warmup_epochs,
+            'min_lr': 1e-6,
+            'scheduler': {'type': 'cosine'},
+        },
+    }
+
+    # Trainer-side arithmetic: ceiling division, then multiply by epochs.
+    steps_per_epoch_opt = max(1, -(-micro_batches_per_epoch // grad_accum_steps))
+    expected_total = num_epochs * steps_per_epoch_opt
+    expected_warmup = warmup_epochs * steps_per_epoch_opt
+    expected_tmax = max(1, expected_total - expected_warmup)
+
+    scheduler, warmup_steps = create_scheduler(optimizer, cfg, steps_per_epoch_opt)
+
+    assert warmup_steps == expected_warmup, (
+        f"warmup_steps mismatch: scheduler={warmup_steps}, expected={expected_warmup}"
+    )
+    assert isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR)
+    assert scheduler.T_max == expected_tmax, (
+        f"CosineAnnealingLR.T_max={scheduler.T_max} but trainer expects {expected_tmax}. "
+        "Scheduler horizon drifted out of sync with optimizer-step accounting."
+    )
