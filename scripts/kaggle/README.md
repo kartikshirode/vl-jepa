@@ -97,6 +97,33 @@ kaggle kernels output <KAGGLE_KERNEL_ID> -p .\kaggle_outputs --quiet
 local path. Mid-run it captures whatever's been written so far — checkpoints,
 partial logs.
 
+## Multi-session runs (the 12-hour wall)
+
+Kaggle kills any session that exceeds 12 hours. At ~4 it/s on T4 with batch
+32, one epoch is ~80 min (train + val), so a full 20-epoch run takes
+~27 hours and spans 2-3 sessions. The kernel script auto-resumes between
+sessions:
+
+1. `kernel-metadata.json` lists the kernel itself in `kernel_sources`, so
+   every new push mounts the previous version's `/kaggle/working/` at
+   `/kaggle/input/<slug>/`.
+2. `train_kaggle.py` scans `/kaggle/input/<slug>/checkpoints/` for the
+   highest `checkpoint_epoch_N.pth` and passes it to `train.py --resume`.
+3. `train.py` restores model + optimizer + scheduler + EMA + epoch counter
+   from the checkpoint and continues from epoch N+1.
+
+To run subsequent sessions, just trigger the kernel again - no code edits.
+Either:
+- Click "Save Version" -> "Save & Run All (Commit)" on the kernel page, or
+- `kaggle kernels push -p scripts/kaggle/` from CLI.
+
+Either action creates a new committed version with the same code; the
+self-referencing `kernel_sources` ensures the previous version's
+checkpoints are mounted at runtime. Expect ~8 epochs per session at 4 it/s,
+so 3 sessions covers a 20-epoch run with margin. Save frequency is every
+2 epochs (`save_every: 2` in the config), so each session loses at most
+two epochs of work if it ends mid-checkpoint.
+
 ## Pulling the final outputs
 
 Once `kaggle kernels status` reports `complete`:

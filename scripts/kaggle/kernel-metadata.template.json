@@ -12,6 +12,8 @@
     "awsaf49/coco-2017-dataset"
   ],
   "competition_sources": [],
-  "kernel_sources": [],
+  "kernel_sources": [
+    "<KAGGLE_USERNAME>/<KERNEL_SLUG>"
+  ],
   "model_sources": []
 }

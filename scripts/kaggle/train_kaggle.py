@@ -2,13 +2,29 @@
 
 This script is the `code_file` referenced by `kernel-metadata.json`. It runs
 inside the Kaggle kernel runtime and handles environment setup, dependency
-install, repo clone, and the training launch. It assumes the kernel has the
-`awsaf49/coco-2017-dataset` dataset attached and a GPU accelerator enabled
-(use "GPU T4 x2" - the script only addresses the first T4).
+install, repo clone, optional checkpoint resume, and the training launch.
 
-Why T4 and not P100: Kaggle's current PyTorch (>= 2.10) dropped support for
-Pascal (sm_60), so a P100 kernel fails to launch CUDA. T4 is Turing (sm_75)
-and supported.
+Requirements (set in kernel-metadata.json + once in the web UI):
+  - Accelerator: "GPU T4 x2" (this script only uses the first T4)
+  - Internet: enabled
+  - Input dataset: awsaf49/coco-2017-dataset
+  - kernel_sources self-reference: lets each new run mount the previous
+    run's /kaggle/working/ as input so checkpoints carry over across the
+    12-hour session cap.
+
+Auto-resume flow:
+  - Session 1 (no prior output): no checkpoint mounted, starts at epoch 0.
+  - Each session saves checkpoint_epoch_N.pth into /kaggle/working/checkpoints/
+    every `save_every` epochs (configured as 2).
+  - Session 2+: this script finds the highest-epoch checkpoint under
+    /kaggle/input/<self-slug>/checkpoints/ and passes it to train.py via
+    --resume. train.py restores model + optimizer + scheduler + EMA + epoch.
+  - Repeat sessions by clicking "Save & Run All" in the kernel's web UI
+    (or `kaggle kernels push -p scripts/kaggle/` from CLI) until num_epochs
+    completes. No code edits needed between sessions.
+
+Why T4 and not P100: Kaggle's PyTorch (>= 2.10) dropped Pascal (sm_60), so
+a P100 kernel fails to launch CUDA. T4 is Turing (sm_75) and supported.
 
 The local laptop config and code stay untouched; this script and the matching
 `configs/config_kaggle_t4.yaml` are the only Kaggle-specific surface.
@@ -25,13 +41,23 @@ REPO_URL = "https://github.com/kartikshirode/vl-jepa.git"
 REPO_DIR = Path("/kaggle/working/vl-jepa")
 KAGGLE_CONFIG_REL = "configs/config_kaggle_t4.yaml"
 KAGGLE_INPUT = Path("/kaggle/input")
-# Dataset hosts pick their own internal layout. Try common shapes for the
-# awsaf49/coco-2017-dataset and fall back to listing /kaggle/input to help
-# diagnose if none match.
+KAGGLE_WORKING = Path("/kaggle/working")
+# COCO dataset candidates. Kaggle mounts datasets at either the modern
+# /kaggle/input/datasets/<owner>/<slug>/ layout or the legacy /kaggle/input/<slug>/,
+# and the awsaf49/coco-2017-dataset packs everything under a coco2017/ subdir.
 DATA_ROOT_CANDIDATES = [
+    Path("/kaggle/input/datasets/awsaf49/coco-2017-dataset/coco2017"),
     Path("/kaggle/input/coco-2017-dataset/coco2017"),
     Path("/kaggle/input/coco-2017-dataset"),
     Path("/kaggle/input/coco2017"),
+]
+# Resume-checkpoint candidates. When this kernel re-runs with itself in
+# kernel_sources, the previous version's /kaggle/working/checkpoints/ ends up
+# under /kaggle/input/<slug>/checkpoints/. Path layout matches the same dual
+# convention as datasets.
+CHECKPOINT_CANDIDATES = [
+    Path("/kaggle/input/vl-jepa-coco-pretraining-p100/checkpoints"),
+    Path("/kaggle/input/datasets/kartikshirode/vl-jepa-coco-pretraining-p100/checkpoints"),
 ]
 
 # Silence noisy warnings before any imports that trigger them.
@@ -171,6 +197,51 @@ def copy_outputs_to_kaggle_root() -> None:
     print(f"Copied {sum(1 for _ in src.glob('*.log'))} log files to {dst}")
 
 
+def find_resume_checkpoint():
+    """Locate the latest checkpoint_epoch_*.pth from a previous kernel run.
+
+    Returns the path to the highest-epoch checkpoint, or None if no previous
+    run output is mounted. With kernel_sources self-referencing this kernel,
+    Kaggle mounts the most recent COMPLETED run's /kaggle/working/checkpoints/
+    under /kaggle/input/.
+
+    First-session runs return None (nothing to resume) and training starts
+    fresh. Subsequent sessions return the latest checkpoint and training
+    resumes from there. Best-by-val checkpoints (best_model.pth) are
+    intentionally NOT used for resume because they may be older than the
+    most recent per-epoch save.
+    """
+    import re
+
+    epoch_pat = re.compile(r"checkpoint_epoch_(\d+)\.pth$")
+    best = None
+    best_epoch = -1
+    for d in CHECKPOINT_CANDIDATES:
+        if not d.exists():
+            continue
+        for p in d.iterdir():
+            m = epoch_pat.search(p.name)
+            if not m:
+                continue
+            epoch = int(m.group(1))
+            if epoch > best_epoch:
+                best_epoch = epoch
+                best = p
+
+    if best is not None:
+        size_mb = best.stat().st_size / (1024 * 1024)
+        print(
+            f"Found resume checkpoint at {best} "
+            f"(epoch {best_epoch}, {size_mb:.0f} MB)"
+        )
+    else:
+        print("No previous-session checkpoint found; starting fresh.")
+        attached = [str(d) for d in CHECKPOINT_CANDIDATES if d.parent.exists()]
+        if attached:
+            print(f"  (Looked under: {attached})")
+    return best
+
+
 def patch_config_for_runtime(data_root: Path) -> Path:
     """Write a runtime-patched copy of the YAML config.
 
@@ -193,9 +264,11 @@ def patch_config_for_runtime(data_root: Path) -> Path:
     return dst
 
 
-def run_training(config_path: Path) -> int:
+def run_training(config_path: Path, resume_from=None) -> int:
     os.chdir(REPO_DIR)
     cmd = [sys.executable, "train.py", "--config", str(config_path)]
+    if resume_from is not None:
+        cmd.extend(["--resume", str(resume_from)])
     banner(f"Launching: {' '.join(cmd)}")
     t0 = time.time()
     try:
@@ -213,6 +286,9 @@ def main() -> int:
     check_gpu()
     data_root = check_dataset()
 
+    banner("Looking for previous-session checkpoint to resume from")
+    resume_ckpt = find_resume_checkpoint()
+
     banner("Installing missing dependencies")
     install_missing_deps()
 
@@ -222,7 +298,11 @@ def main() -> int:
     banner("Patching config with discovered dataset path")
     runtime_config = patch_config_for_runtime(data_root)
 
-    rc = run_training(runtime_config)
+    if resume_ckpt is not None:
+        banner(f"RESUMING from epoch {resume_ckpt.stem.rsplit('_', 1)[-1]}")
+    else:
+        banner("STARTING FRESH (epoch 0)")
+    rc = run_training(runtime_config, resume_from=resume_ckpt)
     copy_outputs_to_kaggle_root()
     return rc
 

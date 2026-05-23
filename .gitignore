@@ -87,3 +87,4 @@ kaggle.json
 **/kaggle.json
 # But the manifest template is the one file we DO want tracked here.
 !scripts/kaggle/kernel-metadata.template.json
+kaggle_v4_pulled/
