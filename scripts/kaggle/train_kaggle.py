@@ -24,7 +24,15 @@ from pathlib import Path
 REPO_URL = "https://github.com/kartikshirode/vl-jepa.git"
 REPO_DIR = Path("/kaggle/working/vl-jepa")
 KAGGLE_CONFIG_REL = "configs/config_kaggle_t4.yaml"
-DATA_ROOT = Path("/kaggle/input/coco-2017-dataset/coco2017")
+KAGGLE_INPUT = Path("/kaggle/input")
+# Dataset hosts pick their own internal layout. Try common shapes for the
+# awsaf49/coco-2017-dataset and fall back to listing /kaggle/input to help
+# diagnose if none match.
+DATA_ROOT_CANDIDATES = [
+    Path("/kaggle/input/coco-2017-dataset/coco2017"),
+    Path("/kaggle/input/coco-2017-dataset"),
+    Path("/kaggle/input/coco2017"),
+]
 
 # Silence noisy warnings before any imports that trigger them.
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -68,26 +76,49 @@ def check_gpu() -> None:
         )
 
 
-def check_dataset() -> None:
-    train_dir = DATA_ROOT / "train2017"
-    val_dir = DATA_ROOT / "val2017"
-    ann_dir = DATA_ROOT / "annotations"
-    missing = [str(p) for p in (train_dir, val_dir, ann_dir) if not p.exists()]
-    if missing:
-        print(
-            "ERROR: COCO 2017 dataset is not mounted where expected.\n"
-            f"  Missing: {missing}\n"
-            "Add the 'awsaf49/coco-2017-dataset' dataset to the kernel "
-            "(Add Input -> Search 'coco-2017-dataset' -> select 'awsaf49').",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    n_train = sum(1 for _ in train_dir.iterdir())
-    n_val = sum(1 for _ in val_dir.iterdir())
-    print(f"COCO 2017 at {DATA_ROOT}")
-    print(f"  train2017: {n_train:,} files")
-    print(f"  val2017:   {n_val:,} files")
-    print(f"  annotations: {[p.name for p in ann_dir.iterdir()]}")
+def check_dataset() -> Path:
+    """Find the COCO 2017 mount and return the data_root path.
+
+    Returns the matched data_root path so the caller can pass it into the
+    training config as an override (avoiding a hardcoded path in the yaml
+    that may drift from what Kaggle actually mounts).
+    """
+    for candidate in DATA_ROOT_CANDIDATES:
+        if (
+            (candidate / "train2017").exists()
+            and (candidate / "val2017").exists()
+            and (candidate / "annotations").exists()
+        ):
+            n_train = sum(1 for _ in (candidate / "train2017").iterdir())
+            n_val = sum(1 for _ in (candidate / "val2017").iterdir())
+            print(f"COCO 2017 at {candidate}")
+            print(f"  train2017: {n_train:,} files")
+            print(f"  val2017:   {n_val:,} files")
+            print(f"  annotations: {[p.name for p in (candidate / 'annotations').iterdir()]}")
+            return candidate
+
+    # No candidate matched. Dump what's actually under /kaggle/input so we
+    # can see what the dataset attach produced.
+    print("ERROR: COCO 2017 dataset not found at any expected path.", file=sys.stderr)
+    print(f"Tried: {[str(p) for p in DATA_ROOT_CANDIDATES]}", file=sys.stderr)
+    if KAGGLE_INPUT.exists():
+        print(f"\nContents of {KAGGLE_INPUT}:", file=sys.stderr)
+        for top in sorted(KAGGLE_INPUT.iterdir()):
+            print(f"  {top}", file=sys.stderr)
+            if top.is_dir():
+                try:
+                    children = sorted(top.iterdir())[:8]
+                except Exception:
+                    children = []
+                for child in children:
+                    marker = "/" if child.is_dir() else ""
+                    print(f"    {child.name}{marker}", file=sys.stderr)
+    print(
+        "\nIf the awsaf49/coco-2017-dataset is attached but at a different "
+        "path, add that path to DATA_ROOT_CANDIDATES in train_kaggle.py.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def clone_repo() -> None:
@@ -140,9 +171,31 @@ def copy_outputs_to_kaggle_root() -> None:
     print(f"Copied {sum(1 for _ in src.glob('*.log'))} log files to {dst}")
 
 
-def run_training() -> int:
+def patch_config_for_runtime(data_root: Path) -> Path:
+    """Write a runtime-patched copy of the YAML config.
+
+    The committed config has data.data_root pinned to what Kaggle SHOULD mount,
+    but check_dataset() may have discovered the dataset at a slightly different
+    path. Override data.data_root with the real path so train.py finds the
+    files. Returns the path to the patched config.
+    """
+    import yaml
+
+    src = REPO_DIR / KAGGLE_CONFIG_REL
+    dst = Path("/kaggle/working/config_kaggle_t4_runtime.yaml")
+    with open(src, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    cfg["data"]["data_root"] = str(data_root)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(dst, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    print(f"Patched config written to {dst} with data_root={data_root}")
+    return dst
+
+
+def run_training(config_path: Path) -> int:
     os.chdir(REPO_DIR)
-    cmd = [sys.executable, "train.py", "--config", KAGGLE_CONFIG_REL]
+    cmd = [sys.executable, "train.py", "--config", str(config_path)]
     banner(f"Launching: {' '.join(cmd)}")
     t0 = time.time()
     try:
@@ -156,9 +209,9 @@ def run_training() -> int:
 
 
 def main() -> int:
-    banner("VL-JEPA on Kaggle P100 — environment check")
+    banner("VL-JEPA on Kaggle T4 — environment check")
     check_gpu()
-    check_dataset()
+    data_root = check_dataset()
 
     banner("Installing missing dependencies")
     install_missing_deps()
@@ -166,7 +219,10 @@ def main() -> int:
     banner("Fetching repository")
     clone_repo()
 
-    rc = run_training()
+    banner("Patching config with discovered dataset path")
+    runtime_config = patch_config_for_runtime(data_root)
+
+    rc = run_training(runtime_config)
     copy_outputs_to_kaggle_root()
     return rc
 
