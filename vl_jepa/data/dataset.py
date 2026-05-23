@@ -75,14 +75,17 @@ class ImageTextDataset(Dataset):
         self.transform = transform
         self.tokenizer = tokenizer
         self.max_length = max_length
-        
+
         # Load annotations
         with open(annotations_file, 'r') as f:
             self.annotations = json.load(f)
-        
+
         # If annotations is a dict with 'annotations' key, extract it
         if isinstance(self.annotations, dict) and 'annotations' in self.annotations:
             self.annotations = self.annotations['annotations']
+
+        # Mutable counter for image-load failures (shared with _safe_load_image).
+        self._failure_counter = [0]
     
     def __len__(self) -> int:
         return len(self.annotations)
@@ -99,11 +102,11 @@ class ImageTextDataset(Dataset):
             # Try with .jpg extension
             image_path = self.images_dir / f"{ann['image_id']:012d}.jpg"
         
-        image = Image.open(image_path).convert('RGB')
-        
+        image = _safe_load_image(image_path, self._failure_counter, len(self.annotations))
+
         if self.transform is not None:
             image = self.transform(image)
-        
+
         # Get caption
         caption = ann.get('caption', ann.get('text', ''))
         
@@ -127,6 +130,7 @@ class ImageTextDataset(Dataset):
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'caption': caption,
+            'image_id': str(image_file),
             'image_path': str(image_path),
         }
 
