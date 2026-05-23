@@ -97,21 +97,38 @@ def load_checkpoint(
     print(f"Loading checkpoint from {checkpoint_path}...")
     checkpoint = _torch_load_safely(checkpoint_path, device)
 
-    state = checkpoint['model_state_dict']
     # Phase-3: drop legacy internal text_encoder.projection.* and
     # target_text_encoder.projection.* keys. They were unused at train time
     # but were saved into older checkpoints, so a clean model now mismatches.
+    # Build a new dict instead of mutating in place so the original checkpoint
+    # payload stays intact (matters when callers reuse the dict afterwards).
     legacy_prefixes = ('text_encoder.projection.', 'target_text_encoder.projection.')
-    removed = [k for k in state if k.startswith(legacy_prefixes)]
-    for k in removed:
-        state.pop(k)
-    if removed:
-        print(f"Dropped {len(removed)} legacy projection keys from checkpoint (e.g. {removed[0]})")
+    state = {
+        k: v for k, v in checkpoint['model_state_dict'].items()
+        if not k.startswith(legacy_prefixes)
+    }
+    removed_count = len(checkpoint['model_state_dict']) - len(state)
+    if removed_count:
+        print(f"Dropped {removed_count} legacy projection keys from checkpoint")
+
     missing, unexpected = model.load_state_dict(state, strict=False)
+    # Predictor was rewritten in phase-3 (block-name change), so old runs trip
+    # missing/unexpected warnings dominated by predictor.* keys. Downgrade
+    # that case to a single info line so eval scripts don't spam the log.
+    def _all_under(keys, prefix_options):
+        return bool(keys) and all(any(k.startswith(p) for p in prefix_options) for k in keys)
+
+    predictor_prefixes = ('predictor.', 'predictor.layers.')
     if missing:
-        print(f"Note: {len(missing)} missing keys in checkpoint (e.g. {missing[0]})")
+        if _all_under(missing, predictor_prefixes):
+            print(f"Info: {len(missing)} predictor keys missing (pre-rewrite checkpoint, will train from scratch)")
+        else:
+            print(f"Note: {len(missing)} missing keys in checkpoint (e.g. {missing[0]})")
     if unexpected:
-        print(f"Note: {len(unexpected)} unexpected keys in checkpoint (e.g. {unexpected[0]})")
+        if _all_under(unexpected, predictor_prefixes):
+            print(f"Info: {len(unexpected)} predictor keys unexpected (pre-rewrite checkpoint, dropped)")
+        else:
+            print(f"Note: {len(unexpected)} unexpected keys in checkpoint (e.g. {unexpected[0]})")
     print("Model weights loaded")
 
     if optimizer is not None and checkpoint.get('optimizer_state_dict') is not None:

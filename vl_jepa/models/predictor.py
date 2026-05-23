@@ -305,6 +305,7 @@ class PredictorWithCrossAttention(nn.Module):
         num_heads: int = 6,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        drop_path_rate: float = 0.0,
         num_patches: int = 196,
     ):
         super().__init__()
@@ -317,13 +318,24 @@ class PredictorWithCrossAttention(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_dim))
         self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
 
+        # Linear stochastic-depth ramp 0 -> drop_path_rate, same as the
+        # self-attention-only PredictorTransformer.
+        if drop_path_rate > 0:
+            dpr = torch.linspace(0.0, drop_path_rate, num_layers).tolist()
+        else:
+            dpr = [0.0] * num_layers
+        DropPath = _get_drop_path_cls()
+
         self.self_attns = nn.ModuleList()
         self.cross_attns = nn.ModuleList()
         self.norm1 = nn.ModuleList()
         self.norm2 = nn.ModuleList()
         self.norm3 = nn.ModuleList()
         self.ffns = nn.ModuleList()
-        for _ in range(num_layers):
+        self.drop_paths_sa = nn.ModuleList()
+        self.drop_paths_ca = nn.ModuleList()
+        self.drop_paths_ffn = nn.ModuleList()
+        for rate in dpr:
             self.self_attns.append(nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True))
             self.cross_attns.append(nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True))
             self.norm1.append(nn.LayerNorm(hidden_dim))
@@ -334,6 +346,14 @@ class PredictorWithCrossAttention(nn.Module):
                 nn.GELU(),
                 nn.Linear(int(hidden_dim * mlp_ratio), hidden_dim),
             ))
+            if DropPath is not None and rate > 0:
+                self.drop_paths_sa.append(DropPath(rate))
+                self.drop_paths_ca.append(DropPath(rate))
+                self.drop_paths_ffn.append(DropPath(rate))
+            else:
+                self.drop_paths_sa.append(nn.Identity())
+                self.drop_paths_ca.append(nn.Identity())
+                self.drop_paths_ffn.append(nn.Identity())
 
         self.norm_out = nn.LayerNorm(hidden_dim)
         self.output_proj = nn.Linear(hidden_dim, output_dim)
@@ -382,18 +402,19 @@ class PredictorWithCrossAttention(nn.Module):
             # PyTorch MHA expects True == "ignore this key".
             kp_mask = (text_attention_mask == 0) if text_attention_mask is not None else None
 
-        for sa, ca, n1, n2, n3, ffn in zip(
+        for sa, ca, n1, n2, n3, ffn, dp_sa, dp_ca, dp_ffn in zip(
             self.self_attns, self.cross_attns, self.norm1, self.norm2, self.norm3, self.ffns,
+            self.drop_paths_sa, self.drop_paths_ca, self.drop_paths_ffn,
         ):
             # Self-attention block (pre-norm).
             h = n1(x)
-            x = x + sa(h, h, h, need_weights=False)[0]
+            x = x + dp_sa(sa(h, h, h, need_weights=False)[0])
             # Cross-attention into text, if available.
             if t is not None:
                 h = n2(x)
-                x = x + ca(h, t, t, key_padding_mask=kp_mask, need_weights=False)[0]
+                x = x + dp_ca(ca(h, t, t, key_padding_mask=kp_mask, need_weights=False)[0])
             # FFN.
-            x = x + ffn(n3(x))
+            x = x + dp_ffn(ffn(n3(x)))
 
         x = self.norm_out(x)
         return self.output_proj(x[:, N_ctx:, :])
@@ -453,6 +474,7 @@ def create_predictor(config: dict, predictor_type: str = "transformer") -> nn.Mo
             num_heads=predictor_config.get('num_heads', 6),
             mlp_ratio=predictor_config.get('mlp_ratio', 4.0),
             dropout=dropout,
+            drop_path_rate=predictor_config.get('drop_path_rate', 0.0),
             num_patches=num_patches,
         )
     else:

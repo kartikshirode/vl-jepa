@@ -150,10 +150,14 @@ class VLJEPAModel(nn.Module):
         requires_grad=False stops gradients, but it does NOT disable dropout
         or stochastic depth. Without this override, drop_path inside the
         target ViT produces noisy targets that hurt the JEPA signal.
+
+        Loops over named_children so any future target_* attribute is caught
+        automatically; missing one would silently regress this.
         """
         super().train(mode)
-        self.target_vision_encoder.eval()
-        self.target_text_encoder.eval()
+        for name, child in self.named_children():
+            if name.startswith('target_'):
+                child.eval()
         return self
     
     def get_trainable_parameters(self):
