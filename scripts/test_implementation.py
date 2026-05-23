@@ -52,7 +52,6 @@ def test_text_encoder():
     
     model = TextEncoder(
         model_name="distilbert-base-uncased",
-        projection_dim=256,
         max_length=128,
         gradient_checkpointing=True,
     )
@@ -69,20 +68,22 @@ def test_text_encoder():
     print(f"✓ Input IDs shape: {tokens['input_ids'].shape}")
     print(f"✓ Attention mask shape: {tokens['attention_mask'].shape}")
     
-    # Test forward pass
+    # Test forward pass. The internal projection was removed; the encoder
+    # now returns raw DistilBERT hidden_size (768).
     with torch.no_grad():
         output = model(
             input_ids=tokens['input_ids'],
             attention_mask=tokens['attention_mask'],
             return_all_tokens=False,
-            return_projected=True,
+            return_projected=False,
         )
-    
+
+    expected_dim = model.embed_dim
     print(f"✓ Output shape: {output.shape}")
-    print(f"✓ Expected: [2, 256] (batch, proj_dim)")
+    print(f"✓ Expected: [2, {expected_dim}] (batch, embed_dim)")
     print(f"✓ Number of parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-    
-    assert output.shape == (2, 256), f"Unexpected output shape: {output.shape}"
+
+    assert output.shape == (2, expected_dim), f"Unexpected output shape: {output.shape}"
     print("✓ Text encoder test PASSED")
     
     return True
@@ -137,11 +138,13 @@ def test_masking():
         allow_overlap=False,
     )
     
-    # Generate masks
-    context_mask, target_mask = mask_gen()
-    
+    # Generate masks. Generator returns (ctx_mask, tgt_mask, ctx_idx, tgt_idx).
+    context_mask, target_mask, ctx_idx, tgt_idx = mask_gen()
+
     print(f"✓ Context mask shape: {context_mask.shape}")
     print(f"✓ Target mask shape: {target_mask.shape}")
+    print(f"✓ Context indices shape: {ctx_idx.shape}")
+    print(f"✓ Target indices shape: {tgt_idx.shape}")
     print(f"✓ Total patches: {mask_gen.total_patches}")
     print(f"✓ Context patches: {context_mask.sum().item()}")
     print(f"✓ Target patches: {target_mask.sum().item()}")
@@ -174,7 +177,6 @@ def test_vl_jepa_model():
     
     text_encoder = TextEncoder(
         model_name="distilbert-base-uncased",
-        projection_dim=None,
         max_length=128,
         gradient_checkpointing=False,  # Disable for testing
     )

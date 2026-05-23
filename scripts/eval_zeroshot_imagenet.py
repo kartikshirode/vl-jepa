@@ -108,6 +108,8 @@ def main():
     correct_top1 = 0
     correct_top5 = 0
     total = 0
+    # Clamp k5 so the script doesn't crash on small-class evaluations.
+    k5 = min(5, len(class_names))
 
     for label, cls_dir in enumerate(tqdm(class_dirs, desc="val images")):
         paths = sorted([p for p in cls_dir.iterdir() if p.suffix.lower() in {'.jpg', '.jpeg', '.png'}])
@@ -118,7 +120,7 @@ def main():
             v = F.normalize(model.vision_projection(v), dim=-1)
             scores = v @ text_classifier.t()  # [B, num_classes]
             top1 = scores.topk(1, dim=1).indices.squeeze(1)
-            top5 = scores.topk(5, dim=1).indices
+            top5 = scores.topk(k5, dim=1).indices
             correct_top1 += (top1 == label).sum().item()
             correct_top5 += (top5 == label).any(dim=1).sum().item()
             total += batch.shape[0]
@@ -127,7 +129,7 @@ def main():
         'num_classes': len(class_names),
         'num_images': total,
         'top1': 100.0 * correct_top1 / max(1, total),
-        'top5': 100.0 * correct_top5 / max(1, total),
+        f'top{k5}': 100.0 * correct_top5 / max(1, total),
     }
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, 'w', encoding='utf-8') as f:
