@@ -1,0 +1,141 @@
+# VL-JEPA configuration for Kaggle Notebooks on a single P100 (16 GB).
+#
+# Differences vs config_dgpu.yaml (intentional, optimized for the Kaggle session):
+#   - data.data_root: points at the pre-mounted Kaggle COCO dataset.
+#   - training.checkpoint_dir: absolute /kaggle/working path so outputs are
+#     captured by the kernel-output mechanism.
+#   - training.batch_size: 32 (up from 16). P100's 16 GB fits this comfortably
+#     and removes the need for gradient accumulation.
+#   - training.gradient_accumulation_steps: 1 (down from 2). Effective batch
+#     remains 32, so the training trajectory matches the local laptop run for
+#     direct comparison.
+#   - training.num_epochs: 20 (down from 30). Kaggle Notebooks have a 12-hour
+#     session cap. P100 at ~25 min/epoch lands ~8.5 hours, comfortable margin.
+#   - training.warmup_epochs: 2 (down from 3). ~10% of total, same ratio.
+#   - data.num_workers: 2. Kaggle gives 4 CPU cores; leave headroom for the
+#     main process and the I/O thread.
+#   - data.persistent_workers: true. The single-shot run benefits from keeping
+#     workers alive across val passes.
+#   - training.save_every: 2 (down from 5). Cheap insurance against session
+#     loss; each checkpoint is ~1 GB so this still fits in /kaggle/working.
+
+model:
+  vision_encoder:
+    type: "vit_tiny_patch16_224"
+    pretrained: true
+    hidden_dim: 192
+    num_layers: 12
+    num_heads: 3
+    patch_size: 16
+    image_size: 224
+    mlp_ratio: 4.0
+    dropout: 0.0
+    attention_dropout: 0.0
+    drop_path_rate: 0.1
+    qkv_bias: true
+    gradient_checkpointing: false
+
+  text_encoder:
+    type: "distilbert-base-uncased"
+    max_length: 128
+    gradient_checkpointing: false
+
+  predictor:
+    type: "transformer"
+    input_dim: 192
+    hidden_dim: 384
+    output_dim: 192
+    num_layers: 6
+    num_heads: 6
+    mlp_ratio: 4.0
+    dropout: 0.0
+    drop_path_rate: 0.1
+
+  embedding_dim: 256
+  temperature: 0.07
+
+training:
+  batch_size: 32
+  gradient_accumulation_steps: 1
+  num_epochs: 20
+
+  learning_rate: 3.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 2
+  warmup_steps: null
+  min_lr: 1.0e-6
+
+  optimizer:
+    type: "adamw"
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  scheduler:
+    type: "cosine"
+    warmup_type: "linear"
+
+  mixed_precision: "fp16"
+  gradient_clip: 1.0
+
+  ema_momentum_start: 0.996
+  ema_momentum_end: 1.0
+
+  jepa_loss_weight: 1.0
+  contrastive_loss_weight: 0.5
+
+  empty_cache_every: 250
+  save_every: 2
+  checkpoint_dir: "/kaggle/working/checkpoints"
+  resume_from: null
+
+data:
+  dataset_name: "coco_captions"
+  data_root: "/kaggle/input/coco-2017-dataset/coco2017"
+  train_split: "train"
+  val_split: "val"
+  max_samples: null
+
+  num_workers: 2
+  pin_memory: true
+  prefetch_factor: 4
+  persistent_workers: true
+
+  image_transforms:
+    resize: 256
+    random_resized_crop: 224
+    random_crop_scale: [0.2, 1.0]
+    random_crop_ratio: [0.75, 1.333]
+    random_horizontal_flip: 0.5
+    color_jitter:
+      brightness: 0.4
+      contrast: 0.4
+      saturation: 0.4
+      hue: 0.1
+      prob: 0.8
+    gaussian_blur_prob: 0.1
+    grayscale_prob: 0.2
+    normalize_mean: [0.485, 0.456, 0.406]
+    normalize_std: [0.229, 0.224, 0.225]
+
+  masking:
+    num_context_blocks: 1
+    num_target_blocks: 4
+    context_scale: [0.85, 1.0]
+    target_scale: [0.15, 0.2]
+    context_aspect_ratio: [1.0, 1.0]
+    target_aspect_ratio: [0.75, 1.5]
+    allow_overlap: false
+    min_keep: 10
+
+logging:
+  log_every: 50
+  use_wandb: false
+  wandb_project: "vl-jepa"
+  wandb_entity: null
+  save_images: false
+  save_images_every: 500
+
+evaluation:
+  eval_every: 1
+  retrieval_k: [1, 5, 10]
+  max_eval_samples: 5000
