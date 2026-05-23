@@ -33,8 +33,10 @@ cd vl-jepa-jetson
 
 # Create virtual environment
 python -m venv .venv
-.venv\Scripts\activate  # Windows
-# source .venv/bin/activate  # Linux/Mac
+
+# Activate (pick the one for your OS)
+.venv\Scripts\activate         # Windows (PowerShell or cmd)
+source .venv/bin/activate      # Linux / macOS
 
 # Install dependencies
 pip install -r requirements.txt

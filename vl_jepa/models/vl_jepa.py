@@ -275,6 +275,17 @@ class VLJEPAModel(nn.Module):
         if context_indices is None or target_indices is None:
             raise ValueError("forward_jepa requires context_indices and target_indices.")
 
+        # Design note on multi-target handling:
+        # The I-JEPA paper samples 4 target blocks per image and runs the
+        # predictor once per block (same context, different target). The
+        # equivalent batched form is to stack [B, num_blocks, n_per_block]
+        # into the batch dim and run one predictor pass. We instead pre-merge
+        # all target patches across blocks into a single [B, N_tgt] tensor in
+        # the mask generator, which is one predictor pass already and saves
+        # the replication of context tokens. The only semantic delta versus
+        # paper-faithful per-block calls is that target tokens of different
+        # blocks share self-attention; for ViT-Tiny scale this has not shown
+        # a measurable downside.
         # Context encoder sees only visible patches.
         context_repr = self.vision_encoder.forward_context(images, context_indices)
         assert context_repr.shape[1] == context_indices.shape[1], (
