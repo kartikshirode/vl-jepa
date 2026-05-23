@@ -52,9 +52,10 @@ runs/
 wandb/
 *.log
 
-# Data - ignore entire dataset directory
-vl_jepa/data/
-data/
+# Data - ignore downloaded dataset directories, NOT the data module code
+vl_jepa/data/COCO2017/
+vl_jepa/data/Flickr30k/
+/data/
 *.zip
 *.tar
 *.tar.gz
