@@ -22,6 +22,7 @@ model:
     num_heads: 4
     mlp_ratio: 4.0
     dropout: 0.0
+    drop_path_rate: 0.1  # Per-residual stochastic depth across predictor layers
   
   embedding_dim: 256
   temperature: 0.07

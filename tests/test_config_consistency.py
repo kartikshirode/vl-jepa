@@ -52,3 +52,21 @@ def test_text_encoder_projection_dim_removed():
         cfg = _load(cfg_path)
         te = cfg['model']['text_encoder']
         assert 'projection_dim' not in te, f"{cfg_path}: leftover projection_dim"
+
+
+def test_predictor_drop_path_rate_is_set():
+    """The per-residual DropPath block reads drop_path_rate from the predictor
+    section; with no key, it defaults to 0.0 and the I-JEPA stochastic-depth
+    schedule is silently disabled. Both configs must set it explicitly."""
+    for cfg_path in [REPO_ROOT / "config_dgpu.yaml",
+                     REPO_ROOT / "configs" / "config_coco_full.yaml"]:
+        cfg = _load(cfg_path)
+        pred = cfg['model']['predictor']
+        assert 'drop_path_rate' in pred, (
+            f"{cfg_path}: predictor.drop_path_rate must be set; otherwise the "
+            f"predictor's stochastic-depth schedule is a no-op."
+        )
+        assert pred['drop_path_rate'] > 0.0, (
+            f"{cfg_path}: predictor.drop_path_rate is set but zero, which "
+            f"defeats the purpose."
+        )

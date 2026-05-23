@@ -32,6 +32,7 @@ class VisionEncoder(nn.Module):
         patch_size: int = 16,
         num_classes: int = 0,
         gradient_checkpointing: bool = True,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
 
@@ -40,12 +41,15 @@ class VisionEncoder(nn.Module):
         self.patch_size = patch_size
         self.num_patches = (img_size // patch_size) ** 2
 
-        # Create ViT model from timm
+        # Create ViT model from timm. drop_path_rate is the I-JEPA-style
+        # stochastic-depth setting on the backbone itself; the config used
+        # to set it but never pass it through, so it was a no-op.
         self.model = timm.create_model(
             model_name,
             pretrained=pretrained,
             num_classes=num_classes,  # Remove classification head
             img_size=img_size,
+            drop_path_rate=drop_path_rate,
         )
 
         # Enable gradient checkpointing for memory efficiency
@@ -177,7 +181,7 @@ class VisionEncoderWithProjection(nn.Module):
     Vision encoder with an additional projection head.
     Useful for matching dimensions with text encoder.
     """
-    
+
     def __init__(
         self,
         model_name: str = "vit_tiny_patch16_224",
@@ -185,15 +189,17 @@ class VisionEncoderWithProjection(nn.Module):
         hidden_dim: int = 192,
         projection_dim: int = 256,
         gradient_checkpointing: bool = True,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
-        
+
         # Vision encoder
         self.encoder = VisionEncoder(
             model_name=model_name,
             pretrained=pretrained,
             hidden_dim=hidden_dim,
             gradient_checkpointing=gradient_checkpointing,
+            drop_path_rate=drop_path_rate,
         )
         
         # Projection head
@@ -248,7 +254,8 @@ def create_vision_encoder(config: dict) -> nn.Module:
     pretrained = vision_config.get('pretrained', True)
     hidden_dim = vision_config.get('hidden_dim', 192)
     gradient_checkpointing = vision_config.get('gradient_checkpointing', True)
-    
+    drop_path_rate = vision_config.get('drop_path_rate', 0.0)
+
     # Check if we need projection
     if 'projection_dim' in config:
         return VisionEncoderWithProjection(
@@ -257,6 +264,7 @@ def create_vision_encoder(config: dict) -> nn.Module:
             hidden_dim=hidden_dim,
             projection_dim=config['projection_dim'],
             gradient_checkpointing=gradient_checkpointing,
+            drop_path_rate=drop_path_rate,
         )
     else:
         return VisionEncoder(
@@ -264,6 +272,7 @@ def create_vision_encoder(config: dict) -> nn.Module:
             pretrained=pretrained,
             hidden_dim=hidden_dim,
             gradient_checkpointing=gradient_checkpointing,
+            drop_path_rate=drop_path_rate,
         )
 
 
