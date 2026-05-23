@@ -10,8 +10,6 @@ model:
   
   text_encoder:
     type: distilbert-base-uncased
-    hidden_dim: 768
-    projection_dim: 384
     max_length: 64
     gradient_checkpointing: false
   

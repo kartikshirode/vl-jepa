@@ -97,7 +97,21 @@ def load_checkpoint(
     print(f"Loading checkpoint from {checkpoint_path}...")
     checkpoint = _torch_load_safely(checkpoint_path, device)
 
-    model.load_state_dict(checkpoint['model_state_dict'])
+    state = checkpoint['model_state_dict']
+    # Phase-3: drop legacy internal text_encoder.projection.* and
+    # target_text_encoder.projection.* keys. They were unused at train time
+    # but were saved into older checkpoints, so a clean model now mismatches.
+    legacy_prefixes = ('text_encoder.projection.', 'target_text_encoder.projection.')
+    removed = [k for k in state if k.startswith(legacy_prefixes)]
+    for k in removed:
+        state.pop(k)
+    if removed:
+        print(f"Dropped {len(removed)} legacy projection keys from checkpoint (e.g. {removed[0]})")
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"Note: {len(missing)} missing keys in checkpoint (e.g. {missing[0]})")
+    if unexpected:
+        print(f"Note: {len(unexpected)} unexpected keys in checkpoint (e.g. {unexpected[0]})")
     print("Model weights loaded")
 
     if optimizer is not None and checkpoint.get('optimizer_state_dict') is not None:

@@ -19,10 +19,7 @@ model:
   
   text_encoder:
     type: "distilbert-base-uncased"
-    hidden_dim: 768
-    projection_dim: 384
     max_length: 128
-    dropout: 0.1
     gradient_checkpointing: false  # Disable for DGPU
   
   predictor:

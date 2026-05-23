@@ -11,54 +11,57 @@ from typing import Optional, Dict
 
 class TextEncoder(nn.Module):
     """
-    Text encoder using DistilBERT for processing text captions.
-    
+    Text encoder using DistilBERT.
+
+    The previous version accepted a `projection_dim` arg that built an
+    internal projection head, but the main VL-JEPA training path used
+    `self.text_projection` on the parent module instead and called this
+    encoder with `return_projected=False`. The internal projection was
+    dead weight. It's been removed; VL-JEPA's text_projection is the
+    single projection in the trainable graph.
+
     Args:
-        model_name: HuggingFace model name (default: distilbert-base-uncased)
-        hidden_dim: Hidden dimension of the model
-        projection_dim: Dimension to project text features to (optional)
-        max_length: Maximum sequence length
-        gradient_checkpointing: Enable gradient checkpointing
+        model_name: HuggingFace model name (default: distilbert-base-uncased).
+        max_length: Maximum sequence length.
+        gradient_checkpointing: Enable gradient checkpointing for memory.
     """
-    
+
     def __init__(
         self,
         model_name: str = "distilbert-base-uncased",
-        hidden_dim: int = 768,
-        projection_dim: Optional[int] = None,
         max_length: int = 128,
         gradient_checkpointing: bool = True,
+        **legacy_kwargs,
     ):
         super().__init__()
-        
+
+        # Friendly migration: accept and ignore `projection_dim` / `hidden_dim`
+        # from older configs without raising, but mention what happened once.
+        if 'projection_dim' in legacy_kwargs and legacy_kwargs['projection_dim'] is not None:
+            import warnings
+            warnings.warn(
+                "TextEncoder.projection_dim is no longer used. VL-JEPA's "
+                "text_projection at the parent level handles dim alignment.",
+                DeprecationWarning,
+            )
+
         self.model_name = model_name
-        self.hidden_dim = hidden_dim
         self.max_length = max_length
-        self.projection_dim = projection_dim
-        
-        # Load tokenizer
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        
-        # Load model
+
         config = AutoConfig.from_pretrained(model_name)
         self.model = AutoModel.from_pretrained(model_name, config=config)
-        
-        # Enable gradient checkpointing for memory efficiency
-        if gradient_checkpointing:
+
+        # Guard against transformers builds that lack gradient_checkpointing_enable.
+        if gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
             self.model.gradient_checkpointing_enable()
-        
-        # Get actual hidden size from model
+
         self.embed_dim = self.model.config.hidden_size
-        
-        # Optional projection layer
-        if projection_dim is not None:
-            self.projection = nn.Sequential(
-                nn.LayerNorm(self.embed_dim),
-                nn.Linear(self.embed_dim, projection_dim),
-            )
-        else:
-            self.projection = None
-    
+        self.hidden_dim = self.embed_dim  # back-compat alias
+        # No internal projection: this module returns raw encoder features.
+        self.projection = None
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -136,29 +139,18 @@ class TextEncoderWithPooling(nn.Module):
     def __init__(
         self,
         model_name: str = "distilbert-base-uncased",
-        projection_dim: Optional[int] = None,
         max_length: int = 128,
         gradient_checkpointing: bool = True,
     ):
         super().__init__()
-        
         self.encoder = TextEncoder(
             model_name=model_name,
-            projection_dim=None,  # We'll add projection after pooling
             max_length=max_length,
             gradient_checkpointing=gradient_checkpointing,
         )
-        
-        # Projection after pooling
-        if projection_dim is not None:
-            self.projection = nn.Sequential(
-                nn.LayerNorm(self.encoder.embed_dim),
-                nn.Linear(self.encoder.embed_dim, projection_dim),
-            )
-        else:
-            self.projection = None
-        
-        self.projection_dim = projection_dim
+        self.embed_dim = self.encoder.embed_dim
+        # No internal projection: VL-JEPA's text_projection runs after this.
+        self.projection = None
     
     def mean_pooling(
         self,
@@ -229,34 +221,22 @@ class TextEncoderWithPooling(nn.Module):
 
 
 def create_text_encoder(config: dict, use_pooling: bool = False) -> nn.Module:
-    """
-    Factory function to create text encoder from config.
-    
-    Args:
-        config: Configuration dictionary
-        use_pooling: Use mean pooling instead of CLS token
-        
-    Returns:
-        TextEncoder or TextEncoderWithPooling
-    """
+    """Factory function to create a TextEncoder from a model config."""
     text_config = config.get('text_encoder', {})
-    
+
     model_name = text_config.get('type', 'distilbert-base-uncased')
-    projection_dim = text_config.get('projection_dim', None)
     max_length = text_config.get('max_length', 128)
     gradient_checkpointing = text_config.get('gradient_checkpointing', True)
-    
+
     if use_pooling:
         return TextEncoderWithPooling(
             model_name=model_name,
-            projection_dim=projection_dim,
             max_length=max_length,
             gradient_checkpointing=gradient_checkpointing,
         )
     else:
         return TextEncoder(
             model_name=model_name,
-            projection_dim=projection_dim,
             max_length=max_length,
             gradient_checkpointing=gradient_checkpointing,
         )
