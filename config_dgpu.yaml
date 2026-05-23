@@ -40,12 +40,12 @@ training:
   # Batch configuration - DGPU can handle larger batches
   batch_size: 16  # Per GPU (increase based on your VRAM)
   gradient_accumulation_steps: 2  # Effective batch = 32
-  num_epochs: 100
-  
+  num_epochs: 30  # COCO emits ~5 captions per image, so each image is seen ~5x per epoch; 30 ~= 150 image-passes per image, plenty for ViT-Tiny
+
   # Optimizer
   learning_rate: 3.0e-4  # Slightly higher LR for larger batches
   weight_decay: 0.05
-  warmup_epochs: 10
+  warmup_epochs: 3  # ~10% of total epochs; the previous 10-epoch warmup was sized for a 100-epoch run
   warmup_steps: null
   min_lr: 1.0e-6
   
