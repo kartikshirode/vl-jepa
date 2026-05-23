@@ -34,12 +34,12 @@ class VisionEncoder(nn.Module):
         gradient_checkpointing: bool = True,
     ):
         super().__init__()
-        
+
         self.hidden_dim = hidden_dim
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = (img_size // patch_size) ** 2
-        
+
         # Create ViT model from timm
         self.model = timm.create_model(
             model_name,
@@ -47,13 +47,15 @@ class VisionEncoder(nn.Module):
             num_classes=num_classes,  # Remove classification head
             img_size=img_size,
         )
-        
+
         # Enable gradient checkpointing for memory efficiency
         if gradient_checkpointing and hasattr(self.model, 'set_grad_checkpointing'):
             self.model.set_grad_checkpointing(enable=True)
-        
+
         # Get embedding dimension from model
         self.embed_dim = self.model.embed_dim
+        # Number of prefix tokens (CLS, dist) varies by ViT variant; timm exposes it.
+        self.num_prefix_tokens = getattr(self.model, 'num_prefix_tokens', 1)
         
     def forward(
         self, 
@@ -81,6 +83,63 @@ class VisionEncoder(nn.Module):
             # Take only CLS token (first token)
             return features[:, 0:1, :]  # [B, 1, D]
     
+    def forward_context(
+        self,
+        x: torch.Tensor,
+        context_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Run the encoder over only the visible context patches.
+
+        This is the I-JEPA context path: patchify, add positional embedding,
+        gather the visible patches by index, then run them through the
+        transformer blocks. The context encoder never sees the target patches,
+        so the predictor can't collapse to the identity solution.
+
+        Args:
+            x: Images [B, 3, H, W]
+            context_indices: LongTensor [B, N_ctx] with indices into the
+                14x14 patch grid (range 0..195 for 224px / 16px patches).
+
+        Returns:
+            [B, N_ctx, D] context patch representations after the final norm.
+        """
+        B = x.shape[0]
+        D = self.embed_dim
+        N_ctx = context_indices.shape[1]
+
+        # 1. Patch embedding -> [B, 196, D]
+        patches = self.model.patch_embed(x)
+
+        # 2. Positional embedding. timm stores pos_embed as either
+        # [1, num_patches, D] (no prefix) or [1, num_patches + num_prefix, D].
+        # We want the per-patch slice without any prefix token positions.
+        pos_embed = self.model.pos_embed
+        if pos_embed.shape[1] == patches.shape[1] + self.num_prefix_tokens:
+            patch_pos = pos_embed[:, self.num_prefix_tokens:, :]
+        else:
+            patch_pos = pos_embed
+        patches = patches + patch_pos
+
+        if hasattr(self.model, 'pos_drop'):
+            patches = self.model.pos_drop(patches)
+
+        # 3. Gather context patches by index.
+        idx = context_indices.unsqueeze(-1).expand(B, N_ctx, D)
+        context_tokens = torch.gather(patches, dim=1, index=idx)
+
+        # 4. Some timm variants apply a pre-norm before blocks; keep it if present.
+        if hasattr(self.model, 'norm_pre'):
+            context_tokens = self.model.norm_pre(context_tokens)
+
+        # 5. Run transformer blocks (no CLS prepended).
+        context_tokens = self.model.blocks(context_tokens)
+
+        # 6. Final norm.
+        context_tokens = self.model.norm(context_tokens)
+
+        return context_tokens
+
     def get_intermediate_layers(
         self,
         x: torch.Tensor,

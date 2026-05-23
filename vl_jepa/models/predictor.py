@@ -93,19 +93,26 @@ class PredictorMLP(nn.Module):
 
 class PredictorTransformer(nn.Module):
     """
-    Transformer-based predictor for JEPA.
-    More powerful than MLP but uses more memory.
-    
+    JEPA predictor: a narrow transformer that takes context patch embeddings
+    plus mask tokens at the target spatial positions, and outputs the predicted
+    representations at those target positions.
+
+    The positional embedding is sized to the full patch grid and indexed by
+    the actual 2D grid location of each token (context or target), so the
+    model has a real signal about where to predict.
+
     Args:
-        input_dim: Input dimension from encoder
-        hidden_dim: Hidden dimension of transformer
-        output_dim: Output dimension
-        num_layers: Number of transformer layers
-        num_heads: Number of attention heads
-        mlp_ratio: MLP hidden dim ratio
-        dropout: Dropout probability
+        input_dim: Input dim from the context encoder.
+        hidden_dim: Predictor working width.
+        output_dim: Output dim (matches target encoder output).
+        num_layers: Transformer depth.
+        num_heads: Attention heads.
+        mlp_ratio: FFN ratio.
+        dropout: Dropout.
+        num_patches: Total number of patch positions in the grid (e.g. 196
+            for 224 / 16). Sized at construction; no hidden 256-token cap.
     """
-    
+
     def __init__(
         self,
         input_dim: int = 192,
@@ -115,24 +122,23 @@ class PredictorTransformer(nn.Module):
         num_heads: int = 6,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        num_patches: int = 196,
     ):
         super().__init__()
-        
+
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.num_layers = num_layers
-        
-        # Input projection
+        self.num_patches = num_patches
+
         self.input_proj = nn.Linear(input_dim, hidden_dim)
-        
-        # Positional embedding (learnable)
-        self.pos_embed = nn.Parameter(torch.zeros(1, 256, hidden_dim))  # Max 256 tokens
-        
-        # Mask tokens (learnable parameters for masked positions)
+
+        # Positional embedding over the full patch grid, indexed by position id.
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_dim))
+        # Learned mask token, same value for every target slot before pos add.
         self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        
-        # Transformer encoder layers
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -140,24 +146,17 @@ class PredictorTransformer(nn.Module):
             dropout=dropout,
             activation='gelu',
             batch_first=True,
-            norm_first=True,  # Pre-norm for better stability
+            norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # Output projection
-        self.output_proj = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, output_dim),
-        )
-        
-        # Initialize weights
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.output_proj = nn.Linear(hidden_dim, output_dim)
+
         self._init_weights()
-    
+
     def _init_weights(self):
-        """Initialize weights"""
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.mask_token, std=0.02)
-        
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.trunc_normal_(m.weight, std=0.02)
@@ -166,53 +165,42 @@ class PredictorTransformer(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.constant_(m.bias, 0)
                 nn.init.constant_(m.weight, 1.0)
-    
+
+    def _gather_pos(self, indices: torch.Tensor) -> torch.Tensor:
+        """Gather positional embedding rows at the given grid indices."""
+        B, N = indices.shape
+        D = self.hidden_dim
+        pos = self.pos_embed.expand(B, -1, -1)  # [B, num_patches, D]
+        idx = indices.unsqueeze(-1).expand(B, N, D)
+        return torch.gather(pos, dim=1, index=idx)
+
     def forward(
         self,
         context_tokens: torch.Tensor,
-        target_positions: Optional[torch.Tensor] = None,
+        context_indices: torch.Tensor,
+        target_indices: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Forward pass through predictor.
-        
         Args:
-            context_tokens: Context patch embeddings [B, N_ctx, D]
-            target_positions: Indices of target positions to predict [B, N_target]
-                            If None, predicts all positions
-            
+            context_tokens: [B, N_ctx, input_dim] from the context encoder.
+            context_indices: [B, N_ctx] grid positions of those tokens.
+            target_indices:  [B, N_tgt] grid positions to predict.
+
         Returns:
-            Predicted target embeddings [B, N_target, D] or [B, N_ctx, D]
+            [B, N_tgt, output_dim] predictions at the target positions.
         """
-        B, N_ctx, D = context_tokens.shape
-        
-        # Project input
-        x = self.input_proj(context_tokens)  # [B, N_ctx, hidden_dim]
-        
-        # Add mask tokens for target positions if specified
-        if target_positions is not None:
-            N_target = target_positions.shape[1]
-            mask_tokens = self.mask_token.expand(B, N_target, -1)
-            # Concatenate context and mask tokens
-            x = torch.cat([x, mask_tokens], dim=1)  # [B, N_ctx + N_target, hidden_dim]
-            N_total = N_ctx + N_target
-        else:
-            N_total = N_ctx
-        
-        # Add positional embeddings
-        x = x + self.pos_embed[:, :N_total, :]
-        
-        # Transformer
-        x = self.transformer(x)  # [B, N_total, hidden_dim]
-        
-        # Extract target predictions
-        if target_positions is not None:
-            # Get only the mask token predictions
-            x = x[:, N_ctx:, :]  # [B, N_target, hidden_dim]
-        
-        # Output projection
-        out = self.output_proj(x)
-        
-        return out
+        B = context_tokens.shape[0]
+        N_ctx = context_indices.shape[1]
+        N_tgt = target_indices.shape[1]
+
+        ctx = self.input_proj(context_tokens) + self._gather_pos(context_indices)
+        mask = self.mask_token.expand(B, N_tgt, -1) + self._gather_pos(target_indices)
+
+        x = torch.cat([ctx, mask], dim=1)
+        x = self.transformer(x)
+        x = self.norm(x)
+        # Only the predictions at the target slots matter.
+        return self.output_proj(x[:, N_ctx:, :])
 
 
 class PredictorWithCrossAttention(nn.Module):
@@ -315,39 +303,48 @@ class PredictorWithCrossAttention(nn.Module):
         return out
 
 
-def create_predictor(config: dict, predictor_type: str = "mlp") -> nn.Module:
+def create_predictor(config: dict, predictor_type: str = "transformer") -> nn.Module:
     """
-    Factory function to create predictor from config.
-    
+    Factory function to create a predictor from config.
+
     Args:
-        config: Configuration dictionary
-        predictor_type: Type of predictor ("mlp", "transformer", "cross_attention")
-        
-    Returns:
-        Predictor module
+        config: Full model config dict (expects 'predictor' and 'vision_encoder' keys).
+        predictor_type: One of 'transformer' (default), 'mlp', or 'cross_attention'.
     """
     predictor_config = config.get('predictor', {})
-    
+    vision_config = config.get('vision_encoder', {})
+
     input_dim = predictor_config.get('input_dim', 192)
-    hidden_dim = predictor_config.get('hidden_dim', 256)
+    hidden_dim = predictor_config.get('hidden_dim', 384)
     output_dim = predictor_config.get('output_dim', 192)
-    num_layers = predictor_config.get('num_layers', 3)
-    dropout = predictor_config.get('dropout', 0.1)
-    
-    if predictor_type == "mlp":
-        return PredictorMLP(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            output_dim=output_dim,
-            num_layers=num_layers,
-            dropout=dropout,
-        )
-    elif predictor_type == "transformer":
+    num_layers = predictor_config.get('num_layers', 6)
+    dropout = predictor_config.get('dropout', 0.0)
+
+    img_size = vision_config.get('image_size', 224)
+    patch_size = vision_config.get('patch_size', 16)
+    num_patches = (img_size // patch_size) ** 2
+
+    if predictor_type == "transformer":
         return PredictorTransformer(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
             output_dim=output_dim,
             num_layers=num_layers,
+            num_heads=predictor_config.get('num_heads', 6),
+            mlp_ratio=predictor_config.get('mlp_ratio', 4.0),
+            dropout=dropout,
+            num_patches=num_patches,
+        )
+    elif predictor_type == "mlp":
+        # Kept for ablation only. Note: has no positional signal, so the JEPA
+        # task collapses to identity if used as the default with a masked
+        # context encoder. Don't use this for real training.
+        return PredictorMLP(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            num_layers=max(num_layers, 2),
+            dropout=dropout,
         )
     elif predictor_type == "cross_attention":
         return PredictorWithCrossAttention(
@@ -383,13 +380,15 @@ if __name__ == "__main__":
         hidden_dim=384,
         output_dim=192,
         num_layers=4,
+        num_patches=196,
     )
-    
+
     context = torch.randn(2, 100, 192)
-    target_pos = torch.randint(0, 196, (2, 50))
-    
+    ctx_idx = torch.randint(0, 196, (2, 100))
+    tgt_idx = torch.randint(0, 196, (2, 50))
+
     with torch.no_grad():
-        out = predictor_trans(context, target_pos)
+        out = predictor_trans(context, ctx_idx, tgt_idx)
         print(f"Transformer output shape: {out.shape}")  # [2, 50, 192]
     
     # Test cross-attention predictor
