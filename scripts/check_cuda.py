@@ -2,6 +2,14 @@
 """Check CUDA availability and diagnose issues."""
 
 import sys
+import platform
+
+if platform.system() == "Windows":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 print("Python:", sys.version)
 print("Python executable:", sys.executable)
 
@@ -33,18 +41,28 @@ try:
         
         # Check CUDA libraries
         import os
-        cuda_paths = [
-            "/usr/local/cuda",
-            "/usr/local/cuda/lib64",
-            "/usr/lib/aarch64-linux-gnu"
-        ]
+        if platform.system() == "Windows":
+            cuda_paths = [
+                os.environ.get("CUDA_PATH", ""),
+                os.environ.get("CUDA_PATH_V12_1", ""),
+                os.environ.get("CUDA_PATH_V11_8", ""),
+                r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA",
+            ]
+            env_var = "PATH"
+        else:
+            cuda_paths = [
+                "/usr/local/cuda",
+                "/usr/local/cuda/lib64",
+                "/usr/lib/aarch64-linux-gnu",
+            ]
+            env_var = "LD_LIBRARY_PATH"
         print("\nCUDA library paths:")
         for p in cuda_paths:
+            if not p:
+                continue
             exists = os.path.exists(p)
             print(f"  {p}: {'EXISTS' if exists else 'NOT FOUND'}")
-        
-        # Check LD_LIBRARY_PATH
-        print("\nLD_LIBRARY_PATH:", os.environ.get("LD_LIBRARY_PATH", "NOT SET"))
+        print(f"\n{env_var}:", os.environ.get(env_var, "NOT SET"))
         
         # Check if torch was built with CUDA
         print("\ntorch.cuda._is_compiled():", torch.cuda._is_compiled() if hasattr(torch.cuda, '_is_compiled') else "N/A")

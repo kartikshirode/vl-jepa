@@ -1,5 +1,14 @@
 """Quick test script for VL-JEPA components"""
 
+import sys
+import platform
+
+if platform.system() == "Windows":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 import torch
 print('Testing VL-JEPA components...')
 
