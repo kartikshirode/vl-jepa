@@ -40,8 +40,13 @@ class VLJEPAModel(nn.Module):
         embedding_dim: int = 256,
         ema_momentum: float = 0.996,
         temperature: float = 0.07,
+        contrastive_loss_type: str = 'infonce',
     ):
         super().__init__()
+        # Optional contrastive loss variant. 'infonce' is the legacy CLIP-style
+        # softmax loss. 'siglip' is the SigLIP sigmoid-per-pair loss from
+        # Zhai et al. 2023, which trains better at small effective batch.
+        self.contrastive_loss_type = contrastive_loss_type
         
         # Context encoders (trainable)
         self.vision_encoder = vision_encoder
@@ -78,6 +83,12 @@ class VLJEPAModel(nn.Module):
         self.ema_momentum = ema_momentum
         self.temperature = temperature
         self.embedding_dim = embedding_dim
+
+        # SigLIP needs learnable scale and bias (Zhai et al. 2023 defaults).
+        if contrastive_loss_type == 'siglip':
+            import math
+            self.siglip_logit_scale = nn.Parameter(torch.tensor(math.log(10.0)))
+            self.siglip_logit_bias = nn.Parameter(torch.tensor(-10.0))
         
         # Initialize projections
         self._init_weights()
@@ -271,8 +282,20 @@ class VLJEPAModel(nn.Module):
             f"{context_indices.shape[1]} context indices."
         )
 
-        # Predict at target positions using context and 2D positional info.
-        predicted_vision = self.predictor(context_repr, context_indices, target_indices)
+        # Predict at target positions. The cross-attention predictor wants
+        # text features as side-information; everyone else ignores them.
+        from .predictor import PredictorWithCrossAttention
+        if isinstance(self.predictor, PredictorWithCrossAttention) and text_input_ids is not None:
+            text_features = self.text_encoder(
+                text_input_ids, text_attention_mask,
+                return_all_tokens=True, return_projected=False,
+            )
+            predicted_vision = self.predictor(
+                context_repr, context_indices, target_indices,
+                text_features=text_features, text_attention_mask=text_attention_mask,
+            )
+        else:
+            predicted_vision = self.predictor(context_repr, context_indices, target_indices)
 
         # Target encoder runs on the full image (no grad), then gather targets.
         with torch.no_grad():
@@ -358,29 +381,28 @@ class VLJEPAModel(nn.Module):
         text_embed: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute contrastive loss (InfoNCE) between vision and text.
-        
-        Args:
-            vision_embed: Vision embeddings [B, D]
-            text_embed: Text embeddings [B, D]
-            
-        Returns:
-            Contrastive loss
+        Contrastive loss between vision and text embeddings.
+
+        Two variants are selectable via self.contrastive_loss_type:
+          - 'infonce' (default): CLIP-style symmetric softmax cross entropy.
+          - 'siglip':            sigmoid-per-pair loss (Zhai et al. 2023).
+                                 Trains better at small effective batch
+                                 (our DGPU profile sits at batch=32).
         """
-        # Compute similarity matrix
-        logits = torch.matmul(vision_embed, text_embed.t()) / self.temperature  # [B, B]
-        
-        # Labels: diagonal elements are positives
-        labels = torch.arange(logits.shape[0], device=logits.device)
-        
-        # Cross entropy loss in both directions
+        B = vision_embed.shape[0]
+        if self.contrastive_loss_type == 'siglip':
+            logits = vision_embed @ text_embed.t() * self.siglip_logit_scale.exp() + self.siglip_logit_bias
+            # Labels: +1 on the diagonal (matched pair), -1 off-diagonal.
+            labels = 2.0 * torch.eye(B, device=logits.device) - 1.0
+            # SigLIP normalizes by B (per pair-row), not B*B.
+            return -F.logsigmoid(labels * logits).sum() / B
+
+        # Default: InfoNCE.
+        logits = (vision_embed @ text_embed.t()) / self.temperature
+        labels = torch.arange(B, device=logits.device)
         loss_i2t = F.cross_entropy(logits, labels)
         loss_t2i = F.cross_entropy(logits.t(), labels)
-        
-        # Average
-        loss = (loss_i2t + loss_t2i) / 2.0
-        
-        return loss
+        return (loss_i2t + loss_t2i) / 2.0
     
     def forward(
         self,
@@ -496,6 +518,7 @@ def create_vl_jepa_model(config: dict) -> VLJEPAModel:
         embedding_dim=config['model'].get('embedding_dim', 256),
         ema_momentum=config['training'].get('ema_momentum_start', 0.996),
         temperature=config['model'].get('temperature', 0.07),
+        contrastive_loss_type=config['model'].get('contrastive_loss_type', 'infonce'),
     )
     
     return model
