@@ -200,22 +200,23 @@ class VLJEPAModel(nn.Module):
     @torch.no_grad()
     def update_target_encoder(self):
         """
-        Update target encoder with EMA of context encoder.
-        Call this after each optimizer step.
+        EMA update of the target encoders from the online encoders.
+        Call after every optimizer step.
+
+        In-place (mul_ / add_) to avoid allocating two new tensors per
+        parameter every step.
         """
-        # Update vision target encoder
+        m = self.ema_momentum
         for param_q, param_k in zip(
             self.vision_encoder.parameters(),
-            self.target_vision_encoder.parameters()
+            self.target_vision_encoder.parameters(),
         ):
-            param_k.data = param_k.data * self.ema_momentum + param_q.data * (1.0 - self.ema_momentum)
-        
-        # Update text target encoder
+            param_k.data.mul_(m).add_(param_q.data, alpha=1.0 - m)
         for param_q, param_k in zip(
             self.text_encoder.parameters(),
-            self.target_text_encoder.parameters()
+            self.target_text_encoder.parameters(),
         ):
-            param_k.data = param_k.data * self.ema_momentum + param_q.data * (1.0 - self.ema_momentum)
+            param_k.data.mul_(m).add_(param_q.data, alpha=1.0 - m)
     
     def _gather_target_patches(
         self,

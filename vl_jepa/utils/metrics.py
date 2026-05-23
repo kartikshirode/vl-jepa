@@ -12,55 +12,65 @@ def compute_retrieval_metrics(
     image_embeds: torch.Tensor,
     text_embeds: torch.Tensor,
     topk: Tuple[int, ...] = (1, 5, 10),
+    image_ids: torch.Tensor = None,
+    text_image_ids: torch.Tensor = None,
 ) -> Dict[str, float]:
     """
-    Compute image-text retrieval metrics.
-    
-    Args:
-        image_embeds: Image embeddings [N, D]
-        text_embeds: Text embeddings [N, D]
-        topk: Top-K values to compute recall at
-        
-    Returns:
-        Dictionary with retrieval metrics
+    Image-text retrieval R@K with proper multi-caption handling.
+
+    COCO has 5 captions per image, so the diagonal-only "correct"
+    assumption produces wrong numbers. When `text_image_ids` (length
+    `len(text_embeds)`, integer ids) and `image_ids` (length
+    `len(image_embeds)`, integer ids) are provided, a text query is
+    considered correct if the top-K images include the image whose id
+    matches text_image_ids[q]; an image query is correct if the top-K
+    texts include any text whose text_image_ids matches image_ids[q].
+
+    When both id tensors are None, the legacy 1-to-1 diagonal behavior
+    is used. Pass ids on COCO; skip them only on toy / synthetic data.
     """
-    # Normalize embeddings
     image_embeds = F.normalize(image_embeds, dim=-1)
     text_embeds = F.normalize(text_embeds, dim=-1)
-    
-    # Compute similarity matrix
-    sim_matrix = torch.matmul(image_embeds, text_embeds.t())  # [N, N]
-    
-    N = sim_matrix.shape[0]
-    
-    metrics = {}
-    
-    # Image to text retrieval
-    for k in topk:
-        # Get top-k text indices for each image
-        _, topk_indices = sim_matrix.topk(k, dim=1)  # [N, k]
-        
-        # Check if correct text is in top-k
-        correct = torch.arange(N, device=sim_matrix.device).unsqueeze(1)  # [N, 1]
-        recall = (topk_indices == correct).any(dim=1).float().mean().item()
-        
-        metrics[f'i2t_recall@{k}'] = recall * 100.0
-    
-    # Text to image retrieval
-    for k in topk:
-        # Get top-k image indices for each text
-        _, topk_indices = sim_matrix.t().topk(k, dim=1)  # [N, k]
-        
-        # Check if correct image is in top-k
-        correct = torch.arange(N, device=sim_matrix.device).unsqueeze(1)  # [N, 1]
-        recall = (topk_indices == correct).any(dim=1).float().mean().item()
-        
-        metrics[f't2i_recall@{k}'] = recall * 100.0
-    
-    # Mean recall
-    mean_recall = np.mean([v for k, v in metrics.items() if 'recall@' in k])
-    metrics['mean_recall'] = mean_recall
-    
+    sim_matrix = image_embeds @ text_embeds.t()  # [N_img, N_txt]
+    N_img, N_txt = sim_matrix.shape
+
+    metrics: Dict[str, float] = {}
+
+    if image_ids is None or text_image_ids is None:
+        if N_img != N_txt:
+            raise ValueError(
+                "When image_ids / text_image_ids aren't provided, "
+                "image_embeds and text_embeds must be the same length."
+            )
+        # Legacy 1-to-1 diagonal mode.
+        for k in topk:
+            _, idx = sim_matrix.topk(k, dim=1)
+            correct = torch.arange(N_img, device=sim_matrix.device).unsqueeze(1)
+            metrics[f'i2t_recall@{k}'] = (idx == correct).any(dim=1).float().mean().item() * 100.0
+        for k in topk:
+            _, idx = sim_matrix.t().topk(k, dim=1)
+            correct = torch.arange(N_txt, device=sim_matrix.device).unsqueeze(1)
+            metrics[f't2i_recall@{k}'] = (idx == correct).any(dim=1).float().mean().item() * 100.0
+    else:
+        image_ids = image_ids.to(sim_matrix.device)
+        text_image_ids = text_image_ids.to(sim_matrix.device)
+
+        # i2t: for each image, are any of its captions in top-K texts?
+        for k in topk:
+            _, top_txt = sim_matrix.topk(k, dim=1)  # [N_img, k]
+            retrieved_owners = text_image_ids[top_txt]  # [N_img, k]
+            hits = (retrieved_owners == image_ids.unsqueeze(1)).any(dim=1)
+            metrics[f'i2t_recall@{k}'] = hits.float().mean().item() * 100.0
+
+        # t2i: for each text, is its source image in top-K images?
+        sim_t = sim_matrix.t()  # [N_txt, N_img]
+        for k in topk:
+            _, top_img = sim_t.topk(k, dim=1)  # [N_txt, k]
+            retrieved_ids = image_ids[top_img]  # [N_txt, k]
+            hits = (retrieved_ids == text_image_ids.unsqueeze(1)).any(dim=1)
+            metrics[f't2i_recall@{k}'] = hits.float().mean().item() * 100.0
+
+    metrics['mean_recall'] = float(np.mean([v for k, v in metrics.items() if 'recall@' in k]))
     return metrics
 
 
