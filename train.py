@@ -50,6 +50,7 @@ def parse_args():
     parser.add_argument("--stage2_lr_factor", type=float, default=0.5, help="LR multiplier for Stage-2 (default: 0.5)")
     parser.add_argument("--stage2_epochs", type=int, default=4, choices=[1, 2, 3, 4], help="Number of epochs for Stage-2 (max: 4)")
     parser.add_argument("--early_stop_patience", type=int, default=2, help="Early stopping patience based on mean recall")
+    parser.add_argument("--compile", action="store_true", help="torch.compile the model (production runs only; ~30s compile cost per code change)")
     return parser.parse_args()
 
 
@@ -455,7 +456,16 @@ def main():
     logger.info("Creating model...")
     model = create_vl_jepa_model(config)
     model = model.to(device)
-    
+
+    # Optional torch.compile. Adds ~30s on first forward; only worth it for
+    # production runs where the graph is stable. Wrap AFTER moving to device.
+    if args.compile:
+        if not hasattr(torch, 'compile'):
+            logger.warning("--compile requested but torch.compile is unavailable in this PyTorch build")
+        else:
+            logger.info("torch.compile(mode='reduce-overhead') enabled")
+            model = torch.compile(model, mode='reduce-overhead')
+
     # Stage-2: Freeze text encoder
     if args.stage2:
         logger.info("=" * 50)
