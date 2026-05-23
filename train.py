@@ -26,7 +26,7 @@ from vl_jepa.data.dataset import create_dataset
 from vl_jepa.data.transforms import get_train_transforms, get_val_transforms
 from vl_jepa.data.collate import jepa_collate_fn
 from vl_jepa.masks.multiblock import create_mask_generator
-from vl_jepa.utils.config import load_config, save_config, print_config
+from vl_jepa.utils.config import load_config, save_config, print_config, validate_config
 from vl_jepa.utils.logger import setup_logger
 from vl_jepa.utils.checkpoint import save_checkpoint, load_checkpoint
 from vl_jepa.utils.metrics import AverageMeter, compute_retrieval_metrics
@@ -64,7 +64,7 @@ def parse_args():
     parser.add_argument("--wandb", action="store_true", help="Use Weights & Biases logging")
     parser.add_argument("--stage2", action="store_true", help="Stage-2 training: freeze text encoder, lower LR")
     parser.add_argument("--stage2_lr_factor", type=float, default=0.5, help="LR multiplier for Stage-2 (default: 0.5)")
-    parser.add_argument("--stage2_epochs", type=int, default=4, choices=[1, 2, 3, 4], help="Number of epochs for Stage-2 (max: 4)")
+    parser.add_argument("--stage2_epochs", type=int, default=None, help="Number of epochs for Stage-2 (overrides training.stage2_epochs in config; default: 4)")
     parser.add_argument("--early_stop_patience", type=int, default=2, help="Early stopping patience based on mean recall")
     parser.add_argument("--compile", action="store_true", help="torch.compile the model (production runs only; ~30s compile cost per code change)")
     return parser.parse_args()
@@ -468,8 +468,9 @@ def validate(
 def main():
     args = parse_args()
     
-    # Load config
+    # Load + sanity-check the config so missing keys surface here, not mid-epoch.
     config = load_config(args.config)
+    validate_config(config)
     print("Configuration:")
     print_config(config)
     
@@ -544,7 +545,7 @@ def main():
         logger.info(f"Frozen text encoder parameters: {freeze_info['frozen_text_params'] / 1e6:.2f}M")
         logger.info(f"Trainable parameters: {freeze_info['trainable_params'] / 1e6:.2f}M")
         logger.info("Text encoder weights are FROZEN - no gradients will flow through DistilBERT")
-        logger.info(f"Stage-2 epochs: {args.stage2_epochs}")
+        logger.info(f"Stage-2 epochs (CLI override): {args.stage2_epochs}")
         logger.info(f"Stage-2 LR factor: {args.stage2_lr_factor}")
         logger.info(f"Early stopping patience: {args.early_stop_patience} (based on mean_recall)")
         
@@ -673,8 +674,15 @@ def main():
             best_metric = checkpoint_info['best_metric']
             logger.info(f"Resumed from epoch {start_epoch}")
     
-    # Training loop
-    num_epochs = args.stage2_epochs if args.stage2 else config['training']['num_epochs']
+    # Training loop. Stage-2 epoch count: CLI > config > default 4.
+    if args.stage2:
+        num_epochs = (
+            args.stage2_epochs
+            if args.stage2_epochs is not None
+            else config['training'].get('stage2_epochs', 4)
+        )
+    else:
+        num_epochs = config['training']['num_epochs']
     checkpoint_dir = Path(config['training'].get('checkpoint_dir', 'checkpoints'))
     checkpoint_dir.mkdir(exist_ok=True)
     save_every = config['training'].get('save_every', 5)

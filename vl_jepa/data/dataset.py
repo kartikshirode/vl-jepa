@@ -161,6 +161,7 @@ class COCOCaptionsDataset(Dataset):
         max_length: int = 128,
         max_samples: Optional[int] = None,
         mask_generator: Optional[Any] = None,
+        max_samples_seed: int = 42,
     ):
         self.data_root = Path(data_root)
         self.split = split
@@ -168,6 +169,7 @@ class COCOCaptionsDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.mask_generator = mask_generator
+        self.max_samples_seed = max_samples_seed
 
         # Determine paths based on split
         if split == 'train':
@@ -206,8 +208,8 @@ class COCOCaptionsDataset(Dataset):
         # Limit samples if specified. Use a local RNG so we don't leak our
         # determinism choice into the global random state.
         if max_samples is not None and len(self.annotations) > max_samples:
-            print(f"Limiting dataset from {len(self.annotations)} to {max_samples} samples")
-            local_rng = random.Random(42)
+            print(f"Limiting dataset from {len(self.annotations)} to {max_samples} samples (seed={self.max_samples_seed})")
+            local_rng = random.Random(self.max_samples_seed)
             self.annotations = local_rng.sample(self.annotations, max_samples)
 
         # Mutable counter (single-element list) for image-load failures.
@@ -295,6 +297,7 @@ class Flickr30kDataset(Dataset):
         max_length: int = 128,
         max_samples: Optional[int] = None,
         mask_generator: Optional[Any] = None,
+        max_samples_seed: int = 42,
     ):
         self.data_root = Path(data_root)
         self.split = split
@@ -302,6 +305,7 @@ class Flickr30kDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.mask_generator = mask_generator
+        self.max_samples_seed = max_samples_seed
 
         # Find images directory
         self.images_dir = self.data_root / 'flickr30k-images'
@@ -323,7 +327,7 @@ class Flickr30kDataset(Dataset):
                 f"Flickr30k split file not found: {split_file}\n"
                 "Download the Karpathy splits (train.txt / val.txt / test.txt) "
                 "and place them in the data root. Refusing to silently use "
-                "all images for split='{split}'."
+                f"all images for split='{split}'."
             )
         with open(split_file, 'r', encoding='utf-8') as f:
             split_images = set(line.strip() for line in f)
@@ -333,7 +337,7 @@ class Flickr30kDataset(Dataset):
         ]
 
         if max_samples is not None and len(self.annotations) > max_samples:
-            local_rng = random.Random(42)
+            local_rng = random.Random(self.max_samples_seed)
             self.annotations = local_rng.sample(self.annotations, max_samples)
 
         self._failure_counter = [0]
@@ -528,10 +532,16 @@ def create_dataset(
     data_root = data_config.get('data_root', './data')
     max_length = config.get('model', {}).get('text_encoder', {}).get('max_length', 128)
     max_samples = data_config.get('max_samples', None)
-    
-    # Adjust max_samples based on split
-    if split == 'val' and max_samples is not None:
-        max_samples = min(max_samples // 10, 5000)  # Use 10% for validation
+    max_samples_seed = data_config.get('max_samples_seed', 42)
+
+    # Adjust max_samples based on split. Prefer the explicit data.max_val_samples
+    # config when present; fall back to the old max_samples//10 cap otherwise.
+    if split == 'val':
+        explicit_val_cap = data_config.get('max_val_samples', None)
+        if explicit_val_cap is not None:
+            max_samples = explicit_val_cap
+        elif max_samples is not None:
+            max_samples = min(max_samples // 10, 5000)
     
     print(f"Creating {dataset_name} dataset (split={split})...")
     
@@ -544,6 +554,7 @@ def create_dataset(
             max_length=max_length,
             max_samples=max_samples,
             mask_generator=mask_generator,
+            max_samples_seed=max_samples_seed,
         )
 
     elif dataset_name == 'flickr30k' or dataset_name == 'flickr':
@@ -555,6 +566,7 @@ def create_dataset(
             max_length=max_length,
             max_samples=max_samples,
             mask_generator=mask_generator,
+            max_samples_seed=max_samples_seed,
         )
 
     elif dataset_name == 'dummy' or dataset_name == 'test':

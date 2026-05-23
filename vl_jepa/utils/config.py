@@ -11,22 +11,68 @@ from omegaconf import OmegaConf
 def load_config(config_path: str) -> Dict[str, Any]:
     """
     Load configuration from YAML file.
-    
+
     Args:
         config_path: Path to config file
-        
+
     Returns:
         Configuration dictionary
     """
     config_path = Path(config_path)
-    
+
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
-    
+
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
-    
+
     return config
+
+
+def validate_config(config: Dict[str, Any]) -> None:
+    """
+    Sanity-check a loaded config so the run fails at startup, not mid-epoch.
+
+    Raises a ValueError listing every required key that's missing. Soft
+    fields (image_transforms, evaluation, etc.) are not enforced here; this
+    only covers things the training loop dereferences without a fallback.
+    """
+    required = [
+        ('model.vision_encoder', dict),
+        ('model.text_encoder', dict),
+        ('model.predictor', dict),
+        ('training.batch_size', int),
+        ('training.gradient_accumulation_steps', int),
+        ('training.num_epochs', int),
+        ('training.learning_rate', (int, float)),
+        ('training.weight_decay', (int, float)),
+        ('training.optimizer', dict),
+        ('training.scheduler', dict),
+        ('data.dataset_name', str),
+        ('data.data_root', str),
+        ('logging', dict),
+    ]
+    missing = []
+    bad_type = []
+    for path, expected in required:
+        node = config
+        ok = True
+        for part in path.split('.'):
+            if not isinstance(node, dict) or part not in node:
+                missing.append(path)
+                ok = False
+                break
+            node = node[part]
+        if ok and not isinstance(node, expected):
+            bad_type.append(f"{path} (got {type(node).__name__}, expected {expected})")
+
+    problems = []
+    if missing:
+        problems.append("missing keys: " + ", ".join(missing))
+    if bad_type:
+        problems.append("wrong types: " + "; ".join(bad_type))
+    if problems:
+        raise ValueError("Config validation failed -- " + " | ".join(problems))
 
 
 def save_config(config: Dict[str, Any], save_path: str):
