@@ -238,16 +238,24 @@ def train_one_epoch(
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
 
-        # Generate per-sample mask indices and stack into batched tensors.
-        ctx_masks, tgt_masks, ctx_idxs, tgt_idxs = [], [], [], []
-        for _ in range(images.shape[0]):
-            cm, tm, ci, ti = mask_generator()
-            ctx_masks.append(cm); tgt_masks.append(tm)
-            ctx_idxs.append(ci); tgt_idxs.append(ti)
-        context_mask = torch.stack(ctx_masks).to(device)
-        target_mask = torch.stack(tgt_masks).to(device)
-        context_indices = torch.stack(ctx_idxs).to(device)
-        target_indices = torch.stack(tgt_idxs).to(device)
+        # Masks are produced inside the dataset (worker-parallel) and arrive
+        # in the collated batch dict. Fall back to the legacy main-loop path
+        # only if the dataset wasn't configured with a mask generator.
+        if 'context_indices' in batch:
+            context_mask = batch['context_mask'].to(device)
+            target_mask = batch['target_mask'].to(device)
+            context_indices = batch['context_indices'].to(device)
+            target_indices = batch['target_indices'].to(device)
+        else:
+            ctx_masks, tgt_masks, ctx_idxs, tgt_idxs = [], [], [], []
+            for _ in range(images.shape[0]):
+                cm, tm, ci, ti = mask_generator()
+                ctx_masks.append(cm); tgt_masks.append(tm)
+                ctx_idxs.append(ci); tgt_idxs.append(ti)
+            context_mask = torch.stack(ctx_masks).to(device)
+            target_mask = torch.stack(tgt_masks).to(device)
+            context_indices = torch.stack(ctx_idxs).to(device)
+            target_indices = torch.stack(tgt_idxs).to(device)
 
         # Forward pass with mixed precision (no-op on CPU)
         with autocast(device_type=device, enabled=use_amp):
@@ -475,22 +483,24 @@ def main():
     logger.info(f"Total parameters: {num_params / 1e6:.2f}M")
     logger.info(f"Trainable parameters: {num_trainable / 1e6:.2f}M")
     
-    # Create datasets
+    # Create datasets. Mask generation now lives in Dataset.__getitem__ so
+    # it can parallelize across DataLoader workers; validation doesn't need
+    # masks (uses contrastive mode only).
     logger.info("Creating datasets...")
     train_transform = get_train_transforms(config['data'])
     val_transform = get_val_transforms(config['data'])
-    
-    # Get tokenizer from model
+
     tokenizer = model.text_encoder.tokenizer
-    
+    mask_generator = create_mask_generator(config['data'])
+
     train_dataset = create_dataset(
         config,
         split='train',
         transform=train_transform,
         tokenizer=tokenizer,
+        mask_generator=mask_generator,
     )
-    
-    # Try to create validation dataset (optional)
+
     val_dataset = None
     try:
         val_dataset = create_dataset(
@@ -498,11 +508,12 @@ def main():
             split='val',
             transform=val_transform,
             tokenizer=tokenizer,
+            mask_generator=None,  # contrastive-only path
         )
         logger.info(f"Val dataset: {len(val_dataset)} samples")
     except FileNotFoundError:
         logger.warning("Validation dataset not found, skipping validation")
-    
+
     logger.info(f"Train dataset: {len(train_dataset)} samples")
     
     # Create dataloaders
@@ -532,9 +543,10 @@ def main():
             collate_fn=jepa_collate_fn,
         )
     
-    # Create mask generator
-    mask_generator = create_mask_generator(config['data'])
-    
+    # Mask generator already built and passed into create_dataset above;
+    # the trainer no longer needs a separate reference (kept as a no-op
+    # arg into train_one_epoch for back-compat).
+
     # Create optimizer and scheduler (with Stage-2 settings if applicable)
     optimizer = create_optimizer(model, config, stage2=args.stage2, stage2_lr_factor=args.stage2_lr_factor)
     scheduler, warmup_steps = create_scheduler(optimizer, config, len(train_loader))

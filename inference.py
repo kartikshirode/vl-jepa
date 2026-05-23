@@ -177,35 +177,55 @@ class VLJEPAInference:
         return best_text, best_score
     
     @torch.no_grad()
+    def index_images(
+        self,
+        image_paths: List[str],
+        batch_size: int = 32,
+    ) -> torch.Tensor:
+        """
+        Encode and normalize a list of images into one [N, D] tensor.
+
+        Use this to pre-compute embeddings once, then query repeatedly via
+        `find_best_image` without re-encoding. Replaces the O(N) re-encode
+        loop the previous implementation did per query.
+        """
+        embeds = []
+        for start in range(0, len(image_paths), batch_size):
+            chunk = image_paths[start:start + batch_size]
+            tensors = []
+            for p in chunk:
+                img = Image.open(p).convert('RGB')
+                tensors.append(self.transform(img))
+            batch = torch.stack(tensors, dim=0).to(self.device)
+            features = self.model.vision_encoder(batch, return_all_tokens=False).squeeze(1)
+            proj = self.model.vision_projection(features)
+            embeds.append(F.normalize(proj, dim=-1).cpu())
+        return torch.cat(embeds, dim=0)
+
+    @torch.no_grad()
     def find_best_image(
         self,
         text: str,
         image_paths: List[str],
+        image_index: torch.Tensor = None,
+        batch_size: int = 32,
     ) -> Tuple[str, float]:
         """
-        Find best matching image for a text.
-        
-        Args:
-            text: Text query
-            image_paths: List of candidate image paths
-            
-        Returns:
-            (best_image_path, similarity_score)
+        Find the best-matching image for a text query.
+
+        If `image_index` (the [N, D] tensor returned by `index_images`) is
+        passed, we skip re-encoding and just do a single matmul. Otherwise
+        we build the index once for this call.
         """
-        text_embed = self.encode_text(text)
-        
-        best_image = None
-        best_score = -1.0
-        
-        for image_path in image_paths:
-            image_embed = self.encode_image(image_path)
-            similarity = torch.dot(image_embed, text_embed).item()
-            
-            if similarity > best_score:
-                best_score = similarity
-                best_image = image_path
-        
-        return best_image, best_score
+        text_embed = self.encode_text(text)  # [D]
+
+        if image_index is None:
+            image_index = self.index_images(image_paths, batch_size=batch_size)
+
+        # Cosine similarity in one shot.
+        scores = image_index @ text_embed  # [N]
+        best_idx = int(scores.argmax().item())
+        return image_paths[best_idx], float(scores[best_idx].item())
 
 
 def main():
