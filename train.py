@@ -6,7 +6,7 @@ Optimized for low memory with FP16, gradient accumulation, and 8-bit AdamW
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import argparse
 from pathlib import Path
 import time
@@ -41,7 +41,7 @@ except ImportError:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train VL-JEPA model")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
+    parser.add_argument("--config", type=str, default="config_dgpu.yaml", help="Path to config file")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--eval_only", action="store_true", help="Only run evaluation")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
@@ -143,6 +143,7 @@ def train_one_epoch(
     logger,
     global_step: int,
     warmup_steps: int,
+    device: str = 'cuda',
     stage2: bool = False,
 ) -> tuple:
     """Train for one epoch"""
@@ -174,13 +175,14 @@ def train_one_epoch(
     contrastive_loss_weight = config['training'].get('contrastive_loss_weight', 0.5)
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-    
+    use_amp = (device == 'cuda')
+
     for batch_idx, batch in enumerate(pbar):
         # Move data to device
-        images = batch['images'].cuda()
-        input_ids = batch['input_ids'].cuda()
-        attention_mask = batch['attention_mask'].cuda()
-        
+        images = batch['images'].to(device)
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+
         # Generate masks (context = visible, target = to predict)
         context_masks = []
         target_masks = []
@@ -188,12 +190,12 @@ def train_one_epoch(
             ctx_mask, tgt_mask = mask_generator()
             context_masks.append(ctx_mask)
             target_masks.append(tgt_mask)
-        
-        context_mask = torch.stack(context_masks).cuda()
-        target_mask = torch.stack(target_masks).cuda()
-        
-        # Forward pass with mixed precision
-        with autocast(enabled=True):
+
+        context_mask = torch.stack(context_masks).to(device)
+        target_mask = torch.stack(target_masks).to(device)
+
+        # Forward pass with mixed precision (no-op on CPU)
+        with autocast(device_type=device, enabled=use_amp):
             outputs = model(
                 images=images,
                 text_input_ids=input_ids,
@@ -268,8 +270,8 @@ def train_one_epoch(
                     'train/step': global_step,
                 })
         
-        # Clear CUDA cache periodically
-        if batch_idx % empty_cache_every == 0:
+        # Clear CUDA cache periodically (CUDA only)
+        if device == 'cuda' and batch_idx % empty_cache_every == 0:
             torch.cuda.empty_cache()
     
     logger.info(f"Epoch {epoch} - Loss: {loss_meter.avg:.4f}, JEPA Loss: {jepa_loss_meter.avg:.4f}, Contrastive Loss: {contrastive_loss_meter.avg:.4f}")
@@ -284,24 +286,25 @@ def validate(
     epoch: int,
     config: Dict,
     logger,
+    device: str = 'cuda',
 ) -> Dict[str, float]:
     """Validate model"""
     model.eval()
-    
+
     loss_meter = AverageMeter()
-    
+
     # Collect embeddings for retrieval
     all_image_embeds = []
     all_text_embeds = []
-    
+
     use_wandb = config['logging'].get('use_wandb', False)
-    
+
     pbar = tqdm(dataloader, desc=f"Validation Epoch {epoch}")
-    
+
     for batch in pbar:
-        images = batch['images'].cuda()
-        input_ids = batch['input_ids'].cuda()
-        attention_mask = batch['attention_mask'].cuda()
+        images = batch['images'].to(device)
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
         
         # Forward pass
         outputs = model(
@@ -472,8 +475,8 @@ def main():
     optimizer = create_optimizer(model, config, stage2=args.stage2, stage2_lr_factor=args.stage2_lr_factor)
     scheduler, warmup_steps = create_scheduler(optimizer, config, len(train_loader))
     
-    # Create gradient scaler for mixed precision
-    scaler = GradScaler(enabled=True)
+    # Create gradient scaler for mixed precision (no-op on CPU)
+    scaler = GradScaler(device=device, enabled=(device == 'cuda'))
     
     # Load checkpoint if resuming
     start_epoch = 0
@@ -530,9 +533,10 @@ def main():
             logger=logger,
             global_step=global_step,
             warmup_steps=warmup_steps if not args.stage2 else 0,  # No warmup for Stage-2
+            device=device,
             stage2=args.stage2,  # Pass stage2 flag for safety checks
         )
-        
+
         # Validate (if val_loader exists)
         val_metrics = {'val_loss': float('inf'), 'mean_recall': 0.0}
         if val_loader is not None:
@@ -542,6 +546,7 @@ def main():
                 epoch=epoch,
                 config=config,
                 logger=logger,
+                device=device,
             )
         
         # Determine if this is the best model
@@ -611,7 +616,7 @@ def main():
     if args.stage2:
         logger.info(f"Stage-2 Best Mean Recall: {best_mean_recall:.2f}%")
     
-    if wandb.run is not None:
+    if HAS_WANDB and wandb is not None and wandb.run is not None:
         wandb.finish()
 
 

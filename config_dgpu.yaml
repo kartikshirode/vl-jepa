@@ -111,16 +111,16 @@ data:
     normalize_mean: [0.485, 0.456, 0.406]
     normalize_std: [0.229, 0.224, 0.225]
 
-masking:
-  # Multi-block masking strategy (following I-JEPA)
-  num_context_blocks: 1
-  num_target_blocks: 4
-  context_scale: [0.85, 1.0]  # Context covers 85-100% of image
-  target_scale: [0.15, 0.2]   # Each target block is 15-20%
-  context_aspect_ratio: [1.0, 1.0]  # Square context
-  target_aspect_ratio: [0.75, 1.5]  # Variable aspect ratio targets
-  allow_overlap: false
-  min_keep: 10
+  masking:
+    # Multi-block masking strategy (following I-JEPA)
+    num_context_blocks: 1
+    num_target_blocks: 4
+    context_scale: [0.85, 1.0]
+    target_scale: [0.15, 0.2]
+    context_aspect_ratio: [1.0, 1.0]
+    target_aspect_ratio: [0.75, 1.5]
+    allow_overlap: false
+    min_keep: 10
 
 logging:
   log_every: 50
