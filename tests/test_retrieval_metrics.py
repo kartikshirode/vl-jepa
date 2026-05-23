@@ -63,3 +63,78 @@ def test_multi_caption_recall():
     assert metrics['t2i_recall@1'] == 100.0, metrics
     # Mean recall must average all 4 stats.
     assert 99.0 <= metrics['mean_recall'] <= 100.0, metrics
+
+
+def test_duplicate_image_gallery_depresses_t2i_recall_at_k():
+    """
+    Lock-in for the validate() dedupe step. The dataset emits one sample per
+    (image, caption) pair, so 5 captions per image produce 5 identical image
+    embeddings. If the dedupe is skipped, those 5 ties fill 5 top-K slots in
+    t2i and t2i_recall@5 collapses to ~t2i_recall@1.
+
+    This test reproduces that pathology with a fixed similarity layout where
+    a single wrong image is the second-closest to every text query. With
+    duplicates left in, that wrong image's 5 copies sit in t2i@5 and the
+    correct (third-closest) image never makes it into top-5. After dedupe,
+    each image contributes one row and the correct image lands in top-5.
+    """
+    import numpy as np
+
+    D = 16
+    n_unique = 8
+    captions_per_image = 5
+    unique_ids = list(range(100, 100 + n_unique))
+    base = torch.eye(n_unique, D)  # well-separated unit vectors
+
+    # Duplicated gallery: captions_per_image copies of each image.
+    gallery_rows = []
+    all_image_ids = []
+    for i, iid in enumerate(unique_ids):
+        for _ in range(captions_per_image):
+            gallery_rows.append(base[i].clone())
+            all_image_ids.append(iid)
+    image_embeds_dup = torch.stack(gallery_rows)  # [40, D]
+
+    # One text per image. Each text is most similar to a WRONG image and
+    # second-most to its CORRECT one. After dedup, the correct image ranks
+    # 2nd in t2i, so it lands in top-5. Without dedup, the 5 duplicates of
+    # the wrong image fill all 5 top slots and the correct image's copies
+    # sit at rank 6-10, outside top-5.
+    text_embeds = torch.zeros(n_unique, D)
+    text_image_ids_list = []
+    for i in range(n_unique):
+        wrong = (i + 1) % n_unique
+        text_embeds[i] = 0.9 * base[wrong] + 0.4 * base[i]
+        text_image_ids_list.append(unique_ids[i])
+    text_image_ids = torch.tensor(text_image_ids_list)
+
+    image_ids_dup = torch.tensor(all_image_ids)
+
+    # Pathological path: leave duplicates in. t2i@5 should be ~0.
+    bad = compute_retrieval_metrics(
+        image_embeds_dup, text_embeds,
+        topk=(1, 5),
+        image_ids=image_ids_dup,
+        text_image_ids=text_image_ids,
+    )
+    assert bad['t2i_recall@5'] < 50.0, (
+        f"Expected duplicate-gallery t2i_recall@5 to be depressed, got {bad}"
+    )
+
+    # Apply the validate() dedupe step.
+    ids_np = np.asarray(all_image_ids)
+    uniq, first_idx = np.unique(ids_np, return_index=True)
+    image_embeds_dedup = image_embeds_dup[torch.from_numpy(first_idx).long()]
+    image_ids_dedup = torch.from_numpy(uniq).long()
+
+    good = compute_retrieval_metrics(
+        image_embeds_dedup, text_embeds,
+        topk=(1, 5),
+        image_ids=image_ids_dedup,
+        text_image_ids=text_image_ids,
+    )
+    # After dedup, the correct image is the 2nd-closest unique image, so it
+    # is solidly inside top-5.
+    assert good['t2i_recall@5'] == 100.0, good
+    # And the dedupe must improve substantially over the broken path.
+    assert good['t2i_recall@5'] - bad['t2i_recall@5'] >= 50.0, (good, bad)

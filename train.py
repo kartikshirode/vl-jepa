@@ -439,12 +439,20 @@ def validate(
         all_image_ids = all_image_ids[:max_eval_samples]
 
     # Build the id tensors when the batches carried image_ids. Each sample is
-    # (image_i, caption_i), so text_image_ids per row equals image_ids per row;
-    # compute_retrieval_metrics uses these to credit any caption of the same
-    # image as a hit. Falls back to the legacy diagonal path on toy datasets.
+    # (image_i, caption_i), so text_image_ids per row equals image_ids per row.
+    # Then dedupe the image gallery to one row per unique image_id. COCO has
+    # ~5 captions per image, so without dedup each image appears 5 times in
+    # image_embeds with identical embeddings (model is deterministic in eval).
+    # Those 5 ties fill 5 top-K slots in t2i and depress t2i_recall@5 close to
+    # t2i_recall@1. The Karpathy COCO 5K convention dedupes the image gallery,
+    # which is what compute_retrieval_metrics expects when N_img != N_txt.
     if len(all_image_ids) == image_embeds.shape[0] and all_image_ids:
-        image_ids = torch.tensor([int(x) for x in all_image_ids], dtype=torch.long)
-        text_image_ids = image_ids
+        import numpy as np
+        ids_np = np.asarray([int(x) for x in all_image_ids])
+        text_image_ids = torch.from_numpy(ids_np).long()
+        unique_ids, first_idx = np.unique(ids_np, return_index=True)
+        image_embeds = image_embeds[torch.from_numpy(first_idx).long()]
+        image_ids = torch.from_numpy(unique_ids).long()
     else:
         image_ids = None
         text_image_ids = None
