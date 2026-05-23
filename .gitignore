@@ -74,3 +74,9 @@ Thumbs.db
 
 # PDF files
 *.pdf
+
+# Kaggle: keep the kernel manifest local since it carries the user's
+# Kaggle username and the kernel's private/public flag. Ship the template
+# (kernel-metadata.template.json) instead so anyone cloning the repo can
+# fill in their own values.
+scripts/kaggle/kernel-metadata.json
