@@ -356,9 +356,14 @@ def validate(
 
     loss_meter = AverageMeter()
 
-    # Collect embeddings for retrieval
+    # Collect embeddings for retrieval. Also accumulate image_ids per step so
+    # we can hand them to compute_retrieval_metrics. On COCO val, each sample
+    # is one (image, caption) pair and the same image_id repeats across the
+    # ~5 captions per image; without ids, the metric collapses to a broken
+    # diagonal that scores roughly 1/5 of the true recall.
     all_image_embeds = []
     all_text_embeds = []
+    all_image_ids = []
 
     use_wandb = config['logging'].get('use_wandb', False)
 
@@ -368,7 +373,7 @@ def validate(
         images = batch['images'].to(device)
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
-        
+
         # Forward pass
         outputs = model(
             images=images,
@@ -376,14 +381,18 @@ def validate(
             text_attention_mask=attention_mask,
             mode="contrastive",
         )
-        
+
         # Collect embeddings
         all_image_embeds.append(outputs['vision_embed'].cpu())
         all_text_embeds.append(outputs['text_embed'].cpu())
-        
+
+        # Collate passes image_ids through as a Python list per batch.
+        if 'image_ids' in batch:
+            all_image_ids.extend(batch['image_ids'])
+
         if 'loss' in outputs:
             loss_meter.update(outputs['loss'].item(), images.size(0))
-    
+
     # Compute retrieval metrics
     image_embeds = torch.cat(all_image_embeds, dim=0)
     text_embeds = torch.cat(all_text_embeds, dim=0)
@@ -394,12 +403,19 @@ def validate(
     if max_eval_samples is not None and image_embeds.shape[0] > max_eval_samples:
         image_embeds = image_embeds[:max_eval_samples]
         text_embeds = text_embeds[:max_eval_samples]
+        all_image_ids = all_image_ids[:max_eval_samples]
 
-    # If the dataset provided image_ids and text_image_ids in the batch, use
-    # them for COCO-aware multi-caption retrieval. Otherwise fall back to the
-    # 1-to-1 diagonal assumption (correct for toy/dummy datasets).
-    image_ids = getattr(dataloader.dataset, '_collected_image_ids', None)
-    text_image_ids = getattr(dataloader.dataset, '_collected_text_image_ids', None)
+    # Build the id tensors when the batches carried image_ids. Each sample is
+    # (image_i, caption_i), so text_image_ids per row equals image_ids per row;
+    # compute_retrieval_metrics uses these to credit any caption of the same
+    # image as a hit. Falls back to the legacy diagonal path on toy datasets.
+    if len(all_image_ids) == image_embeds.shape[0] and all_image_ids:
+        image_ids = torch.tensor([int(x) for x in all_image_ids], dtype=torch.long)
+        text_image_ids = image_ids
+    else:
+        image_ids = None
+        text_image_ids = None
+
     metrics = compute_retrieval_metrics(
         image_embeds, text_embeds,
         image_ids=image_ids, text_image_ids=text_image_ids,
