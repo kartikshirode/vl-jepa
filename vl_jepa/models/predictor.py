@@ -91,6 +91,65 @@ class PredictorMLP(nn.Module):
         return self.mlp(x)
 
 
+def _get_drop_path_cls():
+    """Locate timm's DropPath across timm versions; return None if unavailable."""
+    try:
+        from timm.layers import DropPath
+        return DropPath
+    except ImportError:
+        try:
+            from timm.models.layers import DropPath
+            return DropPath
+        except ImportError:
+            return None
+
+
+class _PredictorBlock(nn.Module):
+    """Pre-norm transformer block with separate DropPath on attn and FFN residuals.
+
+    This is the I-JEPA-faithful shape: each of the two residual branches gets
+    its own stochastic-depth gate, so the two paths drop independently.
+    nn.TransformerEncoderLayer hides its residuals, so we hand-roll the block.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.attn = nn.MultiheadAttention(
+            hidden_dim, num_heads, dropout=dropout, batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        ffn_dim = int(hidden_dim * mlp_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(ffn_dim, hidden_dim),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+        )
+
+        DropPath = _get_drop_path_cls()
+        if DropPath is not None and drop_path > 0:
+            self.drop_path1 = DropPath(drop_path)
+            self.drop_path2 = DropPath(drop_path)
+        else:
+            self.drop_path1 = nn.Identity()
+            self.drop_path2 = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm1(x)
+        x = x + self.drop_path1(self.attn(h, h, h, need_weights=False)[0])
+        x = x + self.drop_path2(self.ffn(self.norm2(x)))
+        return x
+
+
 class PredictorTransformer(nn.Module):
     """
     JEPA predictor: a narrow transformer that takes context patch embeddings
@@ -109,6 +168,8 @@ class PredictorTransformer(nn.Module):
         num_heads: Attention heads.
         mlp_ratio: FFN ratio.
         dropout: Dropout.
+        drop_path_rate: Maximum stochastic-depth rate; ramps linearly from 0
+            at the first layer to this value at the last (I-JEPA recipe).
         num_patches: Total number of patch positions in the grid (e.g. 196
             for 224 / 16). Sized at construction; no hidden 256-token cap.
     """
@@ -140,37 +201,23 @@ class PredictorTransformer(nn.Module):
         # Learned mask token, same value for every target slot before pos add.
         self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
 
-        # Build encoder layers individually so we can attach per-layer DropPath
-        # following the I-JEPA recipe (rate increases linearly with depth).
-        try:
-            from timm.layers import DropPath  # newer timm
-        except ImportError:
-            try:
-                from timm.models.layers import DropPath  # older timm
-            except ImportError:
-                DropPath = None
+        # Per-layer DropPath rate, linear ramp 0 -> drop_path_rate.
+        if drop_path_rate > 0:
+            dpr = torch.linspace(0.0, drop_path_rate, num_layers).tolist()
+        else:
+            dpr = [0.0] * num_layers
 
-        self.layers = nn.ModuleList()
-        self.drop_paths = nn.ModuleList()
-        dpr = torch.linspace(0.0, drop_path_rate, num_layers).tolist() if drop_path_rate > 0 else [0.0] * num_layers
-        for rate in dpr:
-            self.layers.append(nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=num_heads,
-                dim_feedforward=int(hidden_dim * mlp_ratio),
+        self.blocks = nn.ModuleList([
+            _PredictorBlock(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
                 dropout=dropout,
-                activation='gelu',
-                batch_first=True,
-                norm_first=True,
-            ))
-            if DropPath is not None and rate > 0:
-                self.drop_paths.append(DropPath(rate))
-            else:
-                self.drop_paths.append(nn.Identity())
+                drop_path=rate,
+            )
+            for rate in dpr
+        ])
 
-        # Kept as a no-op alias for the old single transformer attribute so
-        # forward() reads naturally.
-        self.transformer = None
         self.norm = nn.LayerNorm(hidden_dim)
         self.output_proj = nn.Linear(hidden_dim, output_dim)
 
@@ -219,11 +266,8 @@ class PredictorTransformer(nn.Module):
         mask = self.mask_token.expand(B, N_tgt, -1) + self._gather_pos(target_indices)
 
         x = torch.cat([ctx, mask], dim=1)
-        for layer, dp in zip(self.layers, self.drop_paths):
-            # nn.TransformerEncoderLayer doesn't expose its residuals, so we
-            # wrap the whole layer in DropPath. Functionally close enough to
-            # I-JEPA's per-residual DropPath for our use case (Tiny ViT scale).
-            x = x + dp(layer(x) - x) if isinstance(dp, nn.Identity) is False else layer(x)
+        for block in self.blocks:
+            x = block(x)
         x = self.norm(x)
         return self.output_proj(x[:, N_ctx:, :])
 
@@ -451,17 +495,23 @@ if __name__ == "__main__":
     # Test cross-attention predictor
     print("\nTesting PredictorWithCrossAttention...")
     predictor_cross = PredictorWithCrossAttention(
-        vision_dim=192,
+        input_dim=192,
         text_dim=768,
         hidden_dim=384,
         output_dim=192,
+        num_patches=196,
     )
-    
-    vision_feat = torch.randn(2, 196, 192)
-    text_feat = torch.randn(2, 128, 768)
-    
+
+    context_feat = torch.randn(2, 100, 192)
+    ctx_idx_c = torch.randint(0, 196, (2, 100))
+    tgt_idx_c = torch.randint(0, 196, (2, 50))
+    text_feat = torch.randn(2, 32, 768)
+    text_mask = torch.ones(2, 32)
+
     with torch.no_grad():
-        out = predictor_cross(vision_feat, text_feat)
-        print(f"Cross-attention output shape: {out.shape}")  # [2, 196, 192]
-    
+        out = predictor_cross(context_feat, ctx_idx_c, tgt_idx_c,
+                              text_features=text_feat,
+                              text_attention_mask=text_mask)
+        print(f"Cross-attention output shape: {out.shape}")  # [2, 50, 192]
+
     print("\nPredictor tests passed!")
