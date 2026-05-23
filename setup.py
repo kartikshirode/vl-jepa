@@ -39,12 +39,12 @@ else:
 setup(
     name="vl-jepa",
     version="0.1.0",
-    author="Your Name",
-    author_email="your.email@example.com",
-    description="Vision-Language Joint Embedding Predictive Architecture for Jetson Orin Nano",
+    author="kartikshirode",
+    author_email="kartikshirode123@gmail.com",
+    description="Vision-Language Joint Embedding Predictive Architecture",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/vl-jepa",
+    url="https://github.com/mandarwagh9/vl-jepa-jetson",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",
@@ -62,9 +62,7 @@ setup(
     extras_require={
         "dev": [
             "pytest>=7.0.0",
-            "black>=22.0.0",
-            "flake8>=4.0.0",
-            "isort>=5.10.0",
+            "pytest-cov>=4.0.0",
         ],
     },
     entry_points={

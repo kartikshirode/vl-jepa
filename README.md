@@ -38,6 +38,15 @@ python -m venv .venv
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Optional: install dev tools (pytest, pytest-cov)
+pip install -e .[dev]
+```
+
+### Running tests
+
+```bash
+pytest tests/ -v
 ```
 
 ## 📊 Dataset Preparation
