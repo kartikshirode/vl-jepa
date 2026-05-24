@@ -3,15 +3,61 @@ Training script for VL-JEPA on Jetson Orin Nano
 Optimized for low memory with FP16, gradient accumulation, and 8-bit AdamW
 """
 
+import os
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.amp import autocast, GradScaler
 import argparse
 from pathlib import Path
 import time
 from tqdm import tqdm
 from typing import Optional, Dict
+
+
+def _setup_distributed():
+    """Initialize torch.distributed when launched via torchrun.
+
+    torchrun sets RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT in
+    the environment. When those are missing (plain `python train.py ...`),
+    we stay in single-process mode and the rest of the script behaves
+    exactly as it did before. The helper returns (rank, local_rank,
+    world_size, is_distributed) so the caller doesn't have to recheck
+    env vars repeatedly.
+
+    The NCCL backend is used on CUDA (faster all-reduce); gloo is the
+    fallback for CPU-only torchrun runs, which we don't expect in
+    practice but keep working for tests.
+    """
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        world_size = int(os.environ["WORLD_SIZE"])
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        return rank, local_rank, world_size, True
+    return 0, 0, 1, False
+
+
+def _is_main_process() -> bool:
+    """True on rank 0 of a DDP run, or always in single-process mode."""
+    return (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    """Return the underlying module from a DDP wrapper, or the model itself."""
+    return model.module if isinstance(model, DDP) else model
+
+
+def _barrier():
+    """Synchronize all ranks. No-op outside DDP."""
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 try:
     import wandb
@@ -247,9 +293,13 @@ def _optimizer_step(
 
     if not skipped:
         # EMA schedule must be in OPTIMIZER STEPS, not micro-batches.
+        # `model` may be wrapped in DistributedDataParallel; the EMA target
+        # encoders and the ema_momentum attribute live on the underlying
+        # VLJEPAModel, so always go through _unwrap.
+        underlying = _unwrap(model)
         progress = min(1.0, global_step / max(1, total_optimizer_steps))
-        model.ema_momentum = ema_start + (ema_end - ema_start) * progress
-        model.update_target_encoder()
+        underlying.ema_momentum = ema_start + (ema_end - ema_start) * progress
+        underlying.update_target_encoder()
 
         if global_step < warmup_steps:
             lr_scale = min(1.0, float(global_step + 1) / max(1, warmup_steps))
@@ -310,8 +360,10 @@ def train_one_epoch(
     jepa_loss_weight = config['training'].get('jepa_loss_weight', 1.0)
     contrastive_loss_weight = config['training'].get('contrastive_loss_weight', 0.5)
     
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-    use_amp = (device == 'cuda')
+    # tqdm should only render on rank 0; other ranks would interleave their
+    # progress bars on stdout and make logs unreadable.
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}", disable=not _is_main_process())
+    use_amp = device.startswith('cuda')
 
     # Total optimizer steps (not micro-batches) drive the EMA schedule.
     # Use ceiling division so the partial-tail flush at end-of-epoch counts.
@@ -345,7 +397,7 @@ def train_one_epoch(
             target_indices = torch.stack(tgt_idxs).to(device)
 
         # Forward pass with mixed precision (no-op on CPU)
-        with autocast(device_type=device, enabled=use_amp):
+        with autocast(device_type='cuda' if device.startswith('cuda') else 'cpu', enabled=use_amp):
             outputs = model(
                 images=images,
                 text_input_ids=input_ids,
@@ -407,7 +459,7 @@ def train_one_epoch(
                 })
         
         # Clear CUDA cache periodically (CUDA only)
-        if device == 'cuda' and batch_idx % empty_cache_every == 0:
+        if device.startswith('cuda') and batch_idx % empty_cache_every == 0:
             torch.cuda.empty_cache()
 
     # Flush any partial gradient-accumulation tail at the end of the epoch.
@@ -452,7 +504,7 @@ def validate(
     all_image_ids = []
 
     use_wandb = config['logging'].get('use_wandb', False)
-    use_amp = (device == 'cuda')
+    use_amp = device.startswith('cuda')
 
     pbar = tqdm(dataloader, desc=f"Validation Epoch {epoch}")
 
@@ -464,7 +516,7 @@ def validate(
         # Forward pass under autocast on CUDA. Without this, validation runs
         # in FP32 at 2x the train batch size, which is the biggest single OOM
         # hazard on 8 GB cards.
-        with autocast(device_type=device, enabled=use_amp):
+        with autocast(device_type='cuda' if device.startswith('cuda') else 'cpu', enabled=use_amp):
             outputs = model(
                 images=images,
                 text_input_ids=input_ids,
@@ -532,55 +584,78 @@ def validate(
 
 def main():
     args = parse_args()
-    
+
+    # Distributed setup. When launched via torchrun (RANK/WORLD_SIZE present
+    # in env), this initializes the process group and pins each rank to its
+    # own GPU; when launched plainly (`python train.py ...`), it stays in
+    # single-process mode. Everything downstream branches off these values.
+    rank, local_rank, world_size, is_distributed = _setup_distributed()
+    is_main = (rank == 0)
+
     # Load + sanity-check the config so missing keys surface here, not mid-epoch.
     config = load_config(args.config)
     validate_config(config)
-    print("Configuration:")
-    print_config(config)
-    
-    # Setup logger
+    if is_main:
+        print("Configuration:")
+        print_config(config)
+        if is_distributed:
+            print(f"Distributed: rank {rank} / world_size {world_size}, "
+                  f"local_rank {local_rank}, effective_batch = "
+                  f"{config['training']['batch_size']} x {world_size} = "
+                  f"{config['training']['batch_size'] * world_size}")
+
+    # Setup logger. Only rank 0 emits to stdout / file; other ranks get a
+    # silent logger so duplicate lines do not flood the log.
     log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    logger = setup_logger(
-        name="vl_jepa",
-        log_file=log_dir / f"train_{time.strftime('%Y%m%d_%H%M%S')}.log",
-    )
-    
-    # Setup device
-    device = args.device
-    if device == 'cuda' and not torch.cuda.is_available():
+    if is_main:
+        log_dir.mkdir(exist_ok=True)
+        logger = setup_logger(
+            name="vl_jepa",
+            log_file=log_dir / f"train_{time.strftime('%Y%m%d_%H%M%S')}.log",
+        )
+    else:
+        # Minimal stub so the rest of the code can call logger.info etc.
+        import logging as _logging
+        logger = _logging.getLogger(f"vl_jepa_silent_rank{rank}")
+        logger.addHandler(_logging.NullHandler())
+        logger.setLevel(_logging.CRITICAL)
+
+    # Setup device. DDP: each rank owns one GPU at index local_rank.
+    if is_distributed and torch.cuda.is_available():
+        device = f"cuda:{local_rank}"
+    elif args.device == 'cuda' and not torch.cuda.is_available():
         logger.warning("CUDA not available, using CPU")
         device = 'cpu'
-    
+    else:
+        device = args.device
+
     logger.info(f"Using device: {device}")
-    if device == 'cuda':
-        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"CUDA Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    
-    # Initialize wandb
-    if args.wandb and HAS_WANDB and config['logging'].get('use_wandb', False):
+    if device.startswith('cuda'):
+        logger.info(f"GPU: {torch.cuda.get_device_name(device)}")
+        logger.info(f"CUDA Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.2f} GB")
+
+    # Initialize wandb only on rank 0; other ranks would create duplicate runs.
+    if is_main and args.wandb and HAS_WANDB and config['logging'].get('use_wandb', False):
         wandb.init(
             project=config['logging'].get('wandb_project', 'vl-jepa'),
             entity=config['logging'].get('wandb_entity', None),
             config=config,
             name=f"vl_jepa_{time.strftime('%Y%m%d_%H%M%S')}",
         )
-    
+
     # Create model
     logger.info("Creating model...")
     model = create_vl_jepa_model(config)
     model = model.to(device)
 
-    # Cache the tokenizer reference BEFORE torch.compile wraps the model.
-    # OptimizedModule attribute forwarding to _orig_mod is not reliable across
-    # torch versions for non-Module attributes, and the dataset construction
-    # below needs the live tokenizer object.
+    # Cache the tokenizer reference BEFORE any wrapper (torch.compile or DDP)
+    # potentially obscures attribute access. The dataset construction below
+    # needs the live tokenizer object.
     tokenizer = model.text_encoder.tokenizer
 
     # Optional torch.compile. Adds ~30s on first forward; only worth it for
     # production runs where the graph is stable. Wrap AFTER moving to device
-    # and AFTER grabbing the tokenizer.
+    # and AFTER grabbing the tokenizer, BEFORE the DDP wrap.
     if args.compile:
         if not hasattr(torch, 'compile'):
             logger.warning("--compile requested but torch.compile is unavailable in this PyTorch build")
@@ -593,7 +668,9 @@ def main():
             logger.info("torch.compile(mode='reduce-overhead') enabled")
             model = torch.compile(model, mode='reduce-overhead')
 
-    # Stage-2: Freeze text encoder
+    # Stage-2: Freeze text encoder. This MUST happen before DDP wraps the
+    # model, otherwise DDP's bucket setup picks up requires_grad=True
+    # for parameters we are about to freeze, and the buckets are static.
     if args.stage2:
         # Stage-2 fine-tunes a Stage-1 checkpoint; without --resume we'd be
         # silently training from scratch with frozen text, which is useless.
@@ -627,6 +704,21 @@ def main():
     num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Total parameters: {num_params / 1e6:.2f}M")
     logger.info(f"Trainable parameters: {num_trainable / 1e6:.2f}M")
+
+    # DDP wrap. Must be AFTER .to(device), AFTER tokenizer capture, AFTER any
+    # Stage-2 parameter freezing. We don't need find_unused_parameters=True:
+    # in mode='both' every trainable parameter participates in the backward
+    # graph (target encoders are no_grad and outside DDP's bucket tracking).
+    if is_distributed:
+        # device_ids must be a single-GPU list when each rank owns one GPU.
+        model = DDP(
+            model,
+            device_ids=[local_rank] if device.startswith('cuda') else None,
+            output_device=local_rank if device.startswith('cuda') else None,
+            find_unused_parameters=False,
+            broadcast_buffers=False,
+        )
+        logger.info(f"DDP wrapped on local_rank={local_rank}, world_size={world_size}")
     
     # Create datasets. Mask generation now lives in Dataset.__getitem__ so
     # it can parallelize across DataLoader workers; validation doesn't need
@@ -667,7 +759,6 @@ def main():
     num_workers = config['data'].get('num_workers', 2)
     train_loader_kwargs = {
         'batch_size': config['training']['batch_size'],
-        'shuffle': True,
         'num_workers': num_workers,
         'pin_memory': config['data'].get('pin_memory', True),
         'collate_fn': jepa_collate_fn,
@@ -677,13 +768,33 @@ def main():
         train_loader_kwargs['persistent_workers'] = config['data'].get('persistent_workers', True)
         train_loader_kwargs['prefetch_factor'] = config['data'].get('prefetch_factor', 2)
         train_loader_kwargs['worker_init_fn'] = _worker_init
-    
+
+    # Under DDP we use DistributedSampler so each rank sees a non-overlapping
+    # slice of the dataset. drop_last=True keeps per-rank batch sizes uniform,
+    # which the all_gather in compute_contrastive_loss requires (tensors of
+    # mismatched shape would crash NCCL). The sampler's set_epoch(epoch) is
+    # called at the top of each train epoch to reshuffle.
+    train_sampler = None
+    if is_distributed:
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank,
+            shuffle=True, drop_last=True,
+        )
+        train_loader_kwargs['sampler'] = train_sampler
+        train_loader_kwargs['shuffle'] = False
+    else:
+        train_loader_kwargs['shuffle'] = True
+
     train_loader = DataLoader(train_dataset, **train_loader_kwargs)
     
     val_loader = None
-    if val_dataset is not None:
-        # Match train batch size (no 2x multiplier); 8 GB cards OOM mid-run
-        # otherwise. A config flag (training.val_batch_size_factor) overrides.
+    if val_dataset is not None and is_main:
+        # Only rank 0 runs validation. compute_contrastive_loss skips the
+        # all-gather in eval mode, so non-rank-0 processes do not need to
+        # iterate the val loader. They will block at a barrier while rank 0
+        # validates and saves the checkpoint. This is the simplest correct
+        # design; the alternative (all ranks validate, gather embeddings)
+        # would save ~30s of wall time per epoch but adds substantial code.
         val_bs_factor = config['training'].get('val_batch_size_factor', 1)
         val_num_workers = config['data'].get('num_workers', 2)
         val_loader_kwargs = {
@@ -707,22 +818,27 @@ def main():
     # never reaches min_lr by end of training.
     grad_accum_steps = config['training']['gradient_accumulation_steps']
     steps_per_epoch_opt = max(1, -(-len(train_loader) // grad_accum_steps))
-    optimizer = create_optimizer(model, config, stage2=args.stage2, stage2_lr_factor=args.stage2_lr_factor)
+    # Optimizer construction reads model.get_parameter_groups, which lives on
+    # VLJEPAModel, not on the DDP wrapper -- pass the unwrapped module.
+    optimizer = create_optimizer(_unwrap(model), config, stage2=args.stage2, stage2_lr_factor=args.stage2_lr_factor)
     scheduler, warmup_steps = create_scheduler(optimizer, config, steps_per_epoch_opt)
-    
+
     # Create gradient scaler for mixed precision (no-op on CPU)
-    scaler = GradScaler(device=device, enabled=(device == 'cuda'))
-    
+    scaler = GradScaler(device=device, enabled=device.startswith('cuda'))
+
     # Load checkpoint if resuming
     start_epoch = 0
     global_step = 0
     best_metric = float('inf') if not args.stage2 else 0.0  # Stage-2 uses mean_recall (higher is better)
     best_mean_recall = 0.0  # Track best mean recall for Stage-2
-    
+
     if args.resume:
+        # load_checkpoint calls model.load_state_dict; the state dict was
+        # saved from the underlying VLJEPAModel (DDP unwraps on save), so it
+        # must be loaded into the unwrapped module too.
         checkpoint_info = load_checkpoint(
             args.resume,
-            model,
+            _unwrap(model),
             optimizer=None if args.stage2 else optimizer,  # Don't load optimizer state for Stage-2
             scheduler=None if args.stage2 else scheduler,  # Don't load scheduler state for Stage-2
             device=device,
@@ -762,6 +878,11 @@ def main():
         logger.info(f"Stage-2: Loss weights LOCKED at jepa={config['training'].get('jepa_loss_weight', 1.0)}, contrastive={config['training'].get('contrastive_loss_weight', 0.5)}")
     
     for epoch in range(start_epoch, num_epochs):
+        # DistributedSampler must be told the current epoch so its internal
+        # RNG advances; without this, every epoch sees the same shuffle.
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         # Train
         train_loss, global_step = train_one_epoch(
             model=model,
@@ -779,11 +900,13 @@ def main():
             stage2=args.stage2,  # Pass stage2 flag for safety checks
         )
 
-        # Validate (if val_loader exists)
+        # Validate (if val_loader exists). Only rank 0 has a val_loader (see
+        # dataloader setup above) and only rank 0 holds the eval graph for
+        # the unwrapped model; other ranks reach the barrier below and wait.
         val_metrics = None
-        if val_loader is not None:
+        if is_main and val_loader is not None:
             val_metrics = validate(
-                model=model,
+                model=_unwrap(model),
                 dataloader=val_loader,
                 epoch=epoch,
                 config=config,
@@ -826,55 +949,71 @@ def main():
             if is_best:
                 best_metric = val_metrics['val_loss']
         
-        # Save checkpoint
-        keep_last_n = config['training'].get('keep_last_n_checkpoints')
-        if args.stage2:
-            # Stage-2: Always save each epoch, mark best
-            save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                global_step=global_step,
-                best_metric=best_mean_recall,
-                config=config,
-                save_path=checkpoint_dir / f"stage2_epoch_{epoch}.pth",
-                is_best=is_best,
-            )
-            _prune_old_checkpoints(checkpoint_dir, "stage2_epoch_*.pth", keep_last_n)
-            if is_best:
+        # Save checkpoint. Only rank 0 writes to disk; other ranks block on
+        # the barrier so they do not race ahead into the next epoch while
+        # rank 0 is still serializing ~1 GB to /kaggle/working.
+        if is_main:
+            keep_last_n = config['training'].get('keep_last_n_checkpoints')
+            # Always save from the unwrapped module so the state dict keys
+            # don't have the DDP "module." prefix; load_checkpoint expects
+            # the unwrapped keys.
+            ckpt_model = _unwrap(model)
+            if args.stage2:
+                # Stage-2: Always save each epoch, mark best
                 save_checkpoint(
-                    model=model,
+                    model=ckpt_model,
                     optimizer=optimizer,
                     scheduler=scheduler,
                     epoch=epoch,
                     global_step=global_step,
                     best_metric=best_mean_recall,
                     config=config,
-                    save_path=checkpoint_dir / "stage2_best.pth",
-                    is_best=True,
-                )
-        else:
-            if (epoch + 1) % save_every == 0 or is_best:
-                save_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    epoch=epoch,
-                    global_step=global_step,
-                    best_metric=best_metric,
-                    config=config,
-                    save_path=checkpoint_dir / f"checkpoint_epoch_{epoch}.pth",
+                    save_path=checkpoint_dir / f"stage2_epoch_{epoch}.pth",
                     is_best=is_best,
                 )
-                _prune_old_checkpoints(checkpoint_dir, "checkpoint_epoch_*.pth", keep_last_n)
-    
+                _prune_old_checkpoints(checkpoint_dir, "stage2_epoch_*.pth", keep_last_n)
+                if is_best:
+                    save_checkpoint(
+                        model=ckpt_model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch,
+                        global_step=global_step,
+                        best_metric=best_mean_recall,
+                        config=config,
+                        save_path=checkpoint_dir / "stage2_best.pth",
+                        is_best=True,
+                    )
+            else:
+                if (epoch + 1) % save_every == 0 or is_best:
+                    save_checkpoint(
+                        model=ckpt_model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch,
+                        global_step=global_step,
+                        best_metric=best_metric,
+                        config=config,
+                        save_path=checkpoint_dir / f"checkpoint_epoch_{epoch}.pth",
+                        is_best=is_best,
+                    )
+                    _prune_old_checkpoints(checkpoint_dir, "checkpoint_epoch_*.pth", keep_last_n)
+        # Resync ranks at the end of every epoch. Without this, rank 1 may
+        # start the next epoch's forward while rank 0 is still saving, which
+        # is fine semantically but produces confusing tqdm interleaving.
+        _barrier()
+
     logger.info("Training completed!")
     if args.stage2:
         logger.info(f"Stage-2 Best Mean Recall: {best_mean_recall:.2f}%")
-    
-    if HAS_WANDB and wandb is not None and wandb.run is not None:
+
+    if is_main and HAS_WANDB and wandb is not None and wandb.run is not None:
         wandb.finish()
+
+    # Clean shutdown of the process group. Skipping this leaves NCCL state
+    # in a state that some PyTorch versions warn about on exit.
+    if is_distributed and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
