@@ -93,15 +93,24 @@ def check_gpu() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    props = torch.cuda.get_device_properties(0)
-    print(f"GPU: {props.name} | VRAM: {props.total_memory / 1024**3:.1f} GB")
+    n = torch.cuda.device_count()
     print(f"PyTorch: {torch.__version__} | CUDA: {torch.version.cuda}")
-    if "T4" not in props.name:
+    print(f"Visible GPUs: {n}")
+    for i in range(n):
+        props = torch.cuda.get_device_properties(i)
+        print(f"  cuda:{i}: {props.name} | VRAM: {props.total_memory / 1024**3:.1f} GB")
+        if "T4" not in props.name:
+            print(
+                f"  WARNING: cuda:{i} is not a T4 (got '{props.name}'). The "
+                f"config_kaggle_t4.yaml was sized for T4 (16 GB, Turing sm_75). "
+                f"If this is a P100, training will crash because Kaggle's "
+                f"PyTorch dropped Pascal (sm_60) support."
+            )
+    if n >= 2:
         print(
-            f"WARNING: expected an NVIDIA T4, got '{props.name}'. The "
-            f"config_kaggle_t4.yaml batch size and worker counts were sized "
-            f"for T4 (16 GB, Turing sm_75). If this is a P100, training will "
-            f"crash because Kaggle's PyTorch dropped Pascal (sm_60) support."
+            f"\nDual-GPU launch path active: train.py will be invoked via "
+            f"torchrun --nproc_per_node={n}. Per-rank batch is set in the "
+            f"config; the effective global batch is per-rank x {n}."
         )
 
 
@@ -267,9 +276,46 @@ def patch_config_for_runtime(data_root: Path) -> Path:
     return dst
 
 
+def _count_visible_gpus() -> int:
+    """How many CUDA devices does PyTorch see in this kernel."""
+    import torch
+    if not torch.cuda.is_available():
+        return 0
+    return torch.cuda.device_count()
+
+
 def run_training(config_path: Path, resume_from=None) -> int:
+    """Launch train.py either single-process or via torchrun for multi-GPU.
+
+    On Kaggle's "GPU T4 x2" accelerator we get 2 T4s; using both ~doubles
+    throughput. The launch decision is dynamic: any kernel that happens to
+    land on a single-GPU host (or has CUDA_VISIBLE_DEVICES restricted)
+    still works by falling back to plain `python train.py`. We don't pin
+    nproc_per_node to a hardcoded 2 because that would crash any future
+    single-GPU kernel.
+
+    Under torchrun: per-rank batch size is config.training.batch_size; the
+    effective global batch is batch_size * nproc_per_node. The contrastive
+    loss all-gathers embeddings across ranks so SigLIP sees the global
+    batch's negatives. The optimizer + scheduler are sized in optimizer
+    steps, which already drops the world_size factor cleanly.
+    """
     os.chdir(REPO_DIR)
-    cmd = [sys.executable, "train.py", "--config", str(config_path)]
+    n_gpus = _count_visible_gpus()
+    if n_gpus >= 2:
+        # Pick a free local port for the rendezvous. Kaggle kernels are
+        # single-host so port collision is only a concern if a previous
+        # run leaked an LISTEN, which has not been observed in practice.
+        cmd = [
+            sys.executable, "-m", "torch.distributed.run",
+            f"--nproc_per_node={n_gpus}",
+            "--master_port=29500",
+            "train.py", "--config", str(config_path),
+        ]
+        banner(f"DDP launch on {n_gpus} GPUs via torchrun")
+    else:
+        cmd = [sys.executable, "train.py", "--config", str(config_path)]
+        banner(f"Single-GPU launch ({n_gpus} GPU visible)")
     if resume_from is not None:
         cmd.extend(["--resume", str(resume_from)])
     banner(f"Launching: {' '.join(cmd)}")

@@ -92,6 +92,12 @@ model:
   contrastive_loss_type: "siglip"
 
 training:
+  # batch_size is the PER-RANK batch under DDP. On Kaggle's "GPU T4 x2" the
+  # train_kaggle.py entrypoint auto-detects 2 GPUs and launches via torchrun
+  # --nproc_per_node=2, giving effective global batch 32 x 2 = 64. The
+  # contrastive loss all-gathers embeddings across ranks so SigLIP sees the
+  # full 64x64 negative matrix. On a single-GPU kernel this number IS the
+  # effective batch.
   batch_size: 32
   gradient_accumulation_steps: 1
   num_epochs: 10
