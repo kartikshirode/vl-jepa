@@ -88,3 +88,6 @@ kaggle.json
 # But the manifest template is the one file we DO want tracked here.
 !scripts/kaggle/kernel-metadata.template.json
 kaggle_v4_pulled/
+# Any directory we use to stage outputs pulled back from a Kaggle kernel run.
+# These contain 1+ GB of checkpoints and the kernel build artifacts.
+kaggle_outputs*/
