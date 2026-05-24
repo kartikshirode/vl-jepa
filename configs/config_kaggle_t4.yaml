@@ -148,9 +148,9 @@ data:
   val_split: "val"
   max_samples: null
 
-  num_workers: 4
+  num_workers: 2
   pin_memory: true
-  prefetch_factor: 8
+  prefetch_factor: 4
   persistent_workers: true
 
   image_transforms:
