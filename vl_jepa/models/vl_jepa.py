@@ -167,16 +167,29 @@ class VLJEPAModel(nn.Module):
         """
         return [p for p in self.parameters() if p.requires_grad]
     
-    def get_parameter_groups(self, base_lr: float, stage2: bool = False):
+    def get_parameter_groups(
+        self,
+        base_lr: float,
+        stage2: bool = False,
+        text_encoder_lr_multiplier: float = 1.0,
+    ):
         """
         Get parameter groups with different learning rates.
-        
+
         Args:
-            base_lr: Base learning rate
-            stage2: If True, text encoder is frozen and excluded
-            
+            base_lr: Base learning rate.
+            stage2: If True, text encoder is frozen and excluded.
+            text_encoder_lr_multiplier: LR multiplier applied to the text
+                encoder param group in Stage-1. VL-JEPA paper Table 5b found
+                x0.05 to x0.10 is the sweet spot; full base LR on a pretrained
+                DistilBERT/EmbeddingGemma destroys CLS representations within
+                a handful of epochs (we hit this on the v7 run: text CLS
+                collapsed to a single vector by epoch 3, contrastive loss
+                stuck at log(N)). Stage-2 freezes the text encoder so the
+                multiplier has no effect there.
+
         Returns:
-            List of parameter groups for optimizer
+            List of parameter groups for optimizer.
         """
         if stage2:
             # Stage-2: Only vision encoder, predictor, and projection heads
@@ -187,10 +200,11 @@ class VLJEPAModel(nn.Module):
                 {'params': list(self.text_projection.parameters()), 'lr': base_lr},
             ]
         else:
-            # Stage-1: All parameters
+            # Stage-1: All parameters, text encoder at base_lr * multiplier.
+            text_lr = base_lr * text_encoder_lr_multiplier
             groups = [
                 {'params': list(self.vision_encoder.parameters()), 'lr': base_lr},
-                {'params': list(self.text_encoder.parameters()), 'lr': base_lr},
+                {'params': list(self.text_encoder.parameters()), 'lr': text_lr},
                 {'params': list(self.predictor.parameters()), 'lr': base_lr},
                 {'params': list(self.vision_projection.parameters()), 'lr': base_lr},
                 {'params': list(self.text_projection.parameters()), 'lr': base_lr},

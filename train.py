@@ -118,7 +118,7 @@ def parse_args():
 
 def create_optimizer(model: nn.Module, config: Dict, stage2: bool = False, stage2_lr_factor: float = 0.5) -> torch.optim.Optimizer:
     """Create optimizer from config
-    
+
     Args:
         model: The VL-JEPA model
         config: Configuration dictionary
@@ -131,15 +131,26 @@ def create_optimizer(model: nn.Module, config: Dict, stage2: bool = False, stage
     weight_decay = config['training']['weight_decay']
     betas = tuple(opt_config.get('betas', [0.9, 0.999]))
     eps = opt_config.get('eps', 1e-8)
-    
+    # Per VL-JEPA paper Table 5b, the pretrained text encoder needs an LR
+    # multiplier of x0.05 to x0.10 to avoid destroying its CLS representations
+    # in the first few epochs. Default to 1.0 so existing configs are unchanged.
+    text_lr_mult = float(config['training'].get('text_encoder_lr_multiplier', 1.0))
+
     # Stage-2: Use reduced learning rate
     if stage2:
         lr = lr * stage2_lr_factor
         print(f"Stage-2: Using reduced LR = {lr:.2e} (factor: {stage2_lr_factor})")
-    
+
     # Get parameter groups (excludes frozen text encoder in Stage-2)
     if hasattr(model, 'get_parameter_groups'):
-        param_groups = model.get_parameter_groups(lr, stage2=stage2)
+        param_groups = model.get_parameter_groups(
+            lr,
+            stage2=stage2,
+            text_encoder_lr_multiplier=text_lr_mult,
+        )
+        if not stage2 and text_lr_mult != 1.0:
+            print(f"Stage-1: text encoder LR = {lr * text_lr_mult:.2e} "
+                  f"(base {lr:.2e} x {text_lr_mult})")
     else:
         # Fallback: only trainable parameters
         param_groups = [p for p in model.parameters() if p.requires_grad]
