@@ -10,6 +10,29 @@
 # "GPU T4 x2" - this script only uses the first T4, so the second one sits
 # idle but no harm done.
 #
+# v8 changelog (paper-grounded fix for v7 contrastive collapse).
+# The v7 run on this config (epochs 0 to 3, then interrupted in epoch 5)
+# collapsed: both the vision and text CLS tokens went to a single direction
+# regardless of input, contrastive loss locked at log(32) = 3.4657, and
+# i2t_recall@1 stayed at ~0.1% (5x random baseline). Post-mortem on
+# checkpoint_epoch_3.pth: text encoder CLS row-norm std was 1.3e-06 (i.e.,
+# DistilBERT's CLS is now a constant vector). Root cause matches VL-JEPA
+# paper Table 5b: hitting a pretrained text encoder with the full base LR
+# (3e-4) destroys its representations in a few epochs. Fixes:
+#   - model.contrastive_loss_type: switched from default infonce to siglip.
+#     At our small batch (32), InfoNCE's anti-collapse property is weak and
+#     the softmax saturates at log(N). SigLIP (Zhai et al. 2023) is the
+#     sigmoid-per-pair variant; the gradient does not vanish when the matrix
+#     gets uniform, so the heads can escape flat regions.
+#   - training.text_encoder_lr_multiplier: 0.05. Paper Table 5b reports a
+#     sweet spot of 0.05 to 0.10; we pick the smaller end since v7 already
+#     showed the text side is the fragile one.
+#   - training.num_epochs: 10 (down from 20). User has ~20h Kaggle GPU
+#     quota left after the v7 misadventure; at the measured 1.5 hours per
+#     epoch on T4 (~3.7 it/s through 18493 steps + val), 10 epochs lands
+#     ~15h with 5h margin against throttling. Cold start, no resume.
+#   - training.warmup_epochs: 1 (10% of run, same ratio as before).
+#
 # Differences vs config_dgpu.yaml (intentional, optimized for the Kaggle session):
 #   - data.data_root: points at the pre-mounted Kaggle COCO dataset.
 #   - training.checkpoint_dir: absolute /kaggle/working path so outputs are
@@ -17,11 +40,7 @@
 #   - training.batch_size: 32 (up from 16). T4's 16 GB fits this comfortably
 #     and removes the need for gradient accumulation.
 #   - training.gradient_accumulation_steps: 1 (down from 2). Effective batch
-#     remains 32, so the training trajectory matches the local laptop run for
-#     direct comparison.
-#   - training.num_epochs: 20 (down from 30). Kaggle Notebooks have a 12-hour
-#     session cap. T4 at ~25-30 min/epoch lands ~8-10 hours, comfortable margin.
-#   - training.warmup_epochs: 2 (down from 3). ~10% of total, same ratio.
+#     remains 32.
 #   - data.num_workers: 4. Kaggle's T4 x2 environment provides 4 vCPUs and the
 #     /kaggle/input filesystem is network-mounted, so JPEG decode + augment is
 #     the bottleneck. Use every CPU; the main process barely loads anything.
@@ -67,15 +86,23 @@ model:
 
   embedding_dim: 256
   temperature: 0.07
+  # See file header for the v7 -> v8 motivation. SigLIP keeps gradients alive
+  # when the cosine-sim matrix flattens, so the contrastive head cannot park
+  # itself in the log(N) basin the InfoNCE path slid into.
+  contrastive_loss_type: "siglip"
 
 training:
   batch_size: 32
   gradient_accumulation_steps: 1
-  num_epochs: 20
+  num_epochs: 10
 
   learning_rate: 3.0e-4
+  # VL-JEPA paper Table 5b: x0.05 on the text encoder is the sweet spot.
+  # Picks the conservative end of the 0.05 to 0.10 range since v7 already
+  # showed full base LR shreds the DistilBERT CLS by epoch 3.
+  text_encoder_lr_multiplier: 0.05
   weight_decay: 0.05
-  warmup_epochs: 2
+  warmup_epochs: 1
   warmup_steps: null
   min_lr: 1.0e-6
 
