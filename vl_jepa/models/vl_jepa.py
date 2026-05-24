@@ -4,6 +4,7 @@ Combines vision encoder, text encoder, and predictor with EMA target encoder
 """
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Tuple
@@ -12,6 +13,62 @@ import copy
 from .vision_encoder import VisionEncoder
 from .text_encoder import TextEncoder
 from .predictor import PredictorMLP, PredictorWithCrossAttention
+
+
+def _ddp_is_active() -> bool:
+    """True only when a real >1-rank process group is initialized.
+
+    Hides single-process and CPU-only paths from the rest of the model so the
+    all-gather wrapper is a clean no-op outside DDP.
+    """
+    return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+
+
+class _AllGatherWithGrad(torch.autograd.Function):
+    """All-gather a tensor across ranks while preserving the autograd graph
+    on the local slice.
+
+    `torch.distributed.all_gather` itself is not autograd-aware. The standard
+    contrastive-DDP pattern (OpenAI CLIP, open_clip, SigLIP impls) wraps it in
+    a custom Function: the forward concatenates rank tensors; the backward
+    receives the gradient for the full [B_global, ...] block and returns only
+    this rank's slice, since the other ranks' slices come from their own
+    encoders and DDP will average their local gradients separately.
+
+    The combined effect across all ranks is identical to running the loss on
+    the full [B_global, B_global] sim matrix on a single device.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        ctx.rank = rank
+        ctx.batch = tensor.shape[0]
+        # all_gather requires identical shapes per rank. DistributedSampler
+        # with drop_last=True keeps that invariant for us; otherwise the
+        # tail batch would crash here.
+        gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, tensor.contiguous())
+        return torch.cat(gathered, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        start = ctx.rank * ctx.batch
+        end = start + ctx.batch
+        return grad_output[start:end].contiguous()
+
+
+def _gather_for_contrastive(tensor: torch.Tensor) -> torch.Tensor:
+    """All-gather embeddings across ranks for the contrastive loss when DDP
+    is active; otherwise return the tensor unchanged.
+
+    Keeping the conditional inside this helper means the loss code reads the
+    same in single-GPU and DDP runs.
+    """
+    if not _ddp_is_active():
+        return tensor
+    return _AllGatherWithGrad.apply(tensor)
 
 
 class VLJEPAModel(nn.Module):
@@ -429,17 +486,33 @@ class VLJEPAModel(nn.Module):
           - 'siglip':            sigmoid-per-pair loss (Zhai et al. 2023).
                                  Trains better at small effective batch
                                  (our DGPU profile sits at batch=32).
+
+        Under DDP the embeddings are first all-gathered across ranks during
+        training so the sim matrix is [B_global, B_global] rather than
+        [B_local, B_local]. Without this, each rank only sees its own slice's
+        negatives and the contrastive signal collapses to whatever a small
+        slice can produce. Outside DDP, _gather_for_contrastive returns its
+        input unchanged so the single-GPU path is bit-for-bit identical.
+
+        The gather is gated on self.training so that validation (which the
+        trainer runs on rank 0 only) does not deadlock waiting for the other
+        ranks to participate in the collective. Eval-mode loss is the local
+        slice's loss; it is only used for the val_loss metric, not gradients.
         """
-        B = vision_embed.shape[0]
+        do_gather = self.training
+        v_all = _gather_for_contrastive(vision_embed) if do_gather else vision_embed
+        t_all = _gather_for_contrastive(text_embed) if do_gather else text_embed
+        B = v_all.shape[0]
+
         if self.contrastive_loss_type == 'siglip':
-            logits = vision_embed @ text_embed.t() * self.siglip_logit_scale.exp() + self.siglip_logit_bias
+            logits = v_all @ t_all.t() * self.siglip_logit_scale.exp() + self.siglip_logit_bias
             # Labels: +1 on the diagonal (matched pair), -1 off-diagonal.
             labels = 2.0 * torch.eye(B, device=logits.device) - 1.0
             # SigLIP normalizes by B (per pair-row), not B*B.
             return -F.logsigmoid(labels * logits).sum() / B
 
         # Default: InfoNCE.
-        logits = (vision_embed @ text_embed.t()) / self.temperature
+        logits = (v_all @ t_all.t()) / self.temperature
         labels = torch.arange(B, device=logits.device)
         loss_i2t = F.cross_entropy(logits, labels)
         loss_t2i = F.cross_entropy(logits.t(), labels)
