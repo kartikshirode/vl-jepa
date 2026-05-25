@@ -159,14 +159,24 @@ data:
     random_crop_scale: [0.2, 1.0]
     random_crop_ratio: [0.75, 1.333]
     random_horizontal_flip: 0.5
+    # v13: trim CPU-heavy augmentations that contributed little to representation
+    # quality but added per-sample decode overhead. Kaggle's 4 vCPUs are the
+    # binding constraint; every microsecond saved per image translates to
+    # higher dataloader throughput.
+    #   - color_jitter.prob 0.8 -> 0.5: still gets a meaningful jitter signal
+    #     across the epoch, but cuts the per-sample CPU work by ~40%.
+    #   - gaussian_blur_prob 0.1 -> 0.0: disabled outright. Random blur is a
+    #     SimCLR-era augmentation; modern JEPA/CLIP recipes don't rely on it
+    #     and it is one of the more expensive CPU operations in the pipeline.
+    #   - grayscale_prob 0.2 -> 0.0: disabled outright. Same logic.
     color_jitter:
       brightness: 0.4
       contrast: 0.4
       saturation: 0.4
       hue: 0.1
-      prob: 0.8
-    gaussian_blur_prob: 0.1
-    grayscale_prob: 0.2
+      prob: 0.5
+    gaussian_blur_prob: 0.0
+    grayscale_prob: 0.0
     normalize_mean: [0.485, 0.456, 0.406]
     normalize_std: [0.229, 0.224, 0.225]
 

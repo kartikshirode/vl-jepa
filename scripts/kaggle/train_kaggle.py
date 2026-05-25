@@ -179,6 +179,55 @@ def clone_repo() -> None:
     print(f"Repo HEAD: {head}")
 
 
+def _try_install_pillow_simd() -> bool:
+    """Best-effort swap stock Pillow for Pillow-SIMD (2-4x faster JPEG decode).
+
+    Pillow-SIMD is an AVX2/SSE4 vectorized fork of Pillow that has historically
+    given 2-4x speedups on JPEG decode + common transforms. Our Kaggle run is
+    CPU-bound on the 4 vCPU box (CPU at 396% / 400% on v11/v12), so faster
+    decode translates directly to higher per-rank throughput.
+
+    The fork tracks slightly older Pillow versions, so the install can collide
+    with the base image's Pillow. We swap with a try/except: on failure we
+    reinstall stock Pillow and continue at baseline speed. Training-side code
+    sees only PIL.Image, which is API-compatible either way.
+
+    Note: this affects the train.py subprocess, not the running train_kaggle.py
+    parent (which has already imported torch + PIL). That's fine because the
+    JPEG decoding happens inside dataloader workers spawned from train.py.
+    """
+    print("Attempting Pillow-SIMD swap...", flush=True)
+    try:
+        # pillow-simd shadows the PIL module name; pip refuses install while
+        # stock Pillow is present. Remove first.
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "-q", "pillow", "Pillow"],
+        )
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-q", "pillow-simd"],
+        )
+        # Probe in a clean subprocess so we don't get the parent's cached PIL.
+        subprocess.check_call(
+            [sys.executable, "-c", "from PIL import Image; print(f'PIL {Image.__version__} (SIMD) ready')"],
+        )
+        print("Pillow-SIMD installed; JPEG decode should be 2-4x faster.", flush=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Pillow-SIMD swap failed (rc={e.returncode}); restoring stock Pillow.", flush=True)
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", "pillow"],
+            )
+            print("Stock Pillow reinstalled; training continues at baseline decode speed.", flush=True)
+        except subprocess.CalledProcessError as restore_err:
+            print(
+                f"ERROR: failed to restore stock Pillow (rc={restore_err.returncode}). "
+                f"PIL import in train.py will likely fail.",
+                file=sys.stderr, flush=True,
+            )
+        return False
+
+
 def install_missing_deps() -> None:
     """Install packages that the Kaggle base image doesn't already provide.
 
@@ -187,8 +236,12 @@ def install_missing_deps() -> None:
     and are the ones train.py + vl_jepa actually need at runtime. Anything
     optional (bitsandbytes, wandb, tensorboard, opencv, matplotlib) is
     intentionally skipped; train.py gracefully degrades when they are absent.
+
+    Pillow-SIMD swap happens last so the einops/omegaconf/etc installs above
+    can't be poisoned by a Pillow uninstall partway through.
     """
     pip_install("einops", "omegaconf", "pycocotools", "accelerate")
+    _try_install_pillow_simd()
 
 
 def copy_outputs_to_kaggle_root() -> None:
