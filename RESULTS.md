@@ -124,7 +124,7 @@ The output bundle from Kaggle contains:
 To verify a checkpoint:
 
 ```powershell
-python scripts/diagnose_checkpoint.py kaggle_outputs/checkpoints/checkpoint_epoch_9.pth configs/config_kaggle_t4.yaml
+python scripts/diagnose_checkpoint.py checkpoints/final_model.pth configs/config_kaggle_t4.yaml
 ```
 
 A healthy checkpoint should show non-trivial row-norm variance on both encoders and a cosine-similarity matrix with std > 0 on the random-input probe. (Note: cosine values can still be high on synthetic noise; the real check is the retrieval metrics on actual data.)

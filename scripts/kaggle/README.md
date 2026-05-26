@@ -140,8 +140,8 @@ kaggle kernels output <KAGGLE_KERNEL_ID> -p .\kaggle_outputs
 
 You'll get:
 
-- `kaggle_outputs/checkpoints/checkpoint_epoch_*.pth` — per-epoch saves.
-- `kaggle_outputs/checkpoints/best_model.pth` — best by val loss.
+- `kaggle_outputs/checkpoints/checkpoint_epoch_*.pth` — per-epoch saves (last 2 kept by `keep_last_n_checkpoints`).
+- `kaggle_outputs/checkpoints/best_model.pth` — best by `mean_recall` (higher is better; the val_loss-based selector was replaced after the v15 run, see RESULTS.md).
 - `kaggle_outputs/logs/train_*.log` — full training log.
 
 To resume locally from a Kaggle checkpoint:

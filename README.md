@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c?logo=pytorch)](https://pytorch.org/)
-[![Tests](https://img.shields.io/badge/tests-66%20passed-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-64%20passed-brightgreen)](tests/)
 
 An implementation of vision-language pretraining combining I-JEPA-style masked patch prediction in latent space with SigLIP-style contrastive alignment. Trained from scratch on COCO 2017 captions; the resulting **154M-parameter model achieves 50.30% i2t recall@1 and 68.04% mean recall on COCO 5K**, beating the typical 30-40% range published for ViT-Tiny scale CLIP-style models.
 
@@ -43,7 +43,7 @@ Top half is text-to-image, bottom half is image-to-text, all queries running aga
 | `scripts/diagnose_checkpoint.py` | Forensic tool: load a checkpoint, inspect projection-head and encoder CLS for collapse |
 | `scripts/plot_training_curves.py` | Parse a training log, generate the loss + retrieval-recall PNG |
 | `scripts/generate_retrieval_examples.py` | Run image<->text retrieval on the val gallery, render a grid of examples |
-| `tests/` | 66 unit + smoke tests covering JEPA loss, masks, EMA schedule, retrieval metrics, DDP all-gather, SigLIP gradient survival, checkpoint round-trip, config consistency |
+| `tests/` | 64 unit + smoke tests covering JEPA loss, masks, EMA schedule, retrieval metrics, DDP all-gather, SigLIP gradient survival, checkpoint round-trip, config consistency, Stage-1 best-checkpoint selection |
 
 ## Architecture
 
@@ -121,7 +121,7 @@ The Kaggle entrypoint auto-detects multi-GPU and launches via `torchrun --nproc_
 ```powershell
 python inference.py \
     --config configs/config_kaggle_t4.yaml \
-    --checkpoint kaggle_outputs/checkpoints/checkpoint_epoch_9.pth \
+    --checkpoint checkpoints/final_model.pth \
     --mode similarity \
     --image path/to/img.jpg \
     --text "a description of the image"
@@ -131,11 +131,11 @@ python inference.py \
 
 ```powershell
 # Training curves from the log
-python scripts/plot_training_curves.py kaggle_outputs/logs/train_*.log
+python scripts/plot_training_curves.py logs/v15_final_train.log
 
 # Retrieval examples grid from the checkpoint + val gallery
 python scripts/generate_retrieval_examples.py \
-    --checkpoint kaggle_outputs/checkpoints/checkpoint_epoch_9.pth \
+    --checkpoint checkpoints/final_model.pth \
     --config configs/config_kaggle_t4.yaml \
     --data-root vl_jepa/data/COCO2017
 ```
@@ -144,7 +144,7 @@ python scripts/generate_retrieval_examples.py \
 
 ```powershell
 python scripts/diagnose_checkpoint.py \
-    kaggle_outputs/checkpoints/checkpoint_epoch_9.pth \
+    checkpoints/final_model.pth \
     configs/config_kaggle_t4.yaml
 ```
 
@@ -154,7 +154,7 @@ python scripts/diagnose_checkpoint.py \
 
 ```powershell
 python train.py --config config_dgpu.yaml \
-    --resume kaggle_outputs/checkpoints/checkpoint_epoch_9.pth \
+    --resume checkpoints/final_model.pth \
     --stage2
 ```
 
@@ -164,7 +164,7 @@ python train.py --config config_dgpu.yaml \
 python -m pytest tests/ -v
 ```
 
-66 tests covering masking, JEPA loss, EMA schedule, retrieval metrics dedupe, checkpoint round-trip, DDP all-gather autograd behavior, SigLIP gradient survival on uniform similarity matrices, config consistency between the two YAML files, and several smoke tests for module imports and forward passes.
+64 tests covering masking, JEPA loss, EMA schedule, retrieval metrics dedupe, checkpoint round-trip, DDP all-gather autograd behavior, SigLIP gradient survival on uniform similarity matrices, Stage-1 best-checkpoint selection by mean_recall, config consistency between the two YAML files, and several smoke tests for module imports and forward passes.
 
 ## Configurations
 
