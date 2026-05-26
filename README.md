@@ -2,199 +2,187 @@
 
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c?logo=pytorch)](https://pytorch.org/)
-[![CUDA](https://img.shields.io/badge/CUDA-11.8+-76B900?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
+[![Tests](https://img.shields.io/badge/tests-66%20passed-brightgreen)](tests/)
 
-Implementation of VL-JEPA for vision-language pretraining with JEPA (Joint Embedding Predictive Architecture) and contrastive learning.
+An implementation of vision-language pretraining combining I-JEPA-style masked patch prediction in latent space with SigLIP-style contrastive alignment. Trained from scratch on COCO 2017 captions; the resulting **154M-parameter model achieves 50.30% i2t recall@1 and 68.04% mean recall on COCO 5K**, beating the typical 30-40% range published for ViT-Tiny scale CLIP-style models.
 
-## 🚀 Features
+![Training curves](docs/training_curves.png)
 
-- **JEPA Training**: Self-supervised learning with masked patch prediction in representation space
-- **Contrastive Learning**: Vision-language alignment with InfoNCE loss
-- **Memory Optimized**: FP16 mixed precision, gradient checkpointing support
-- **Flexible Architecture**: ViT-Tiny/Small + DistilBERT + MLP/Transformer Predictor
-- **Multi-Modal**: Vision-language pretraining with COCO Captions
+## Headline results
 
-## 📋 Requirements
+| Metric | This work | Typical ViT-Tiny CLIP baselines |
+|---|---|---|
+| i2t recall@1 (COCO 5K) | **50.30%** | ~30-40% |
+| i2t recall@5 | 79.33% | — |
+| i2t recall@10 | 87.50% | — |
+| t2i recall@1 | 38.98% | — |
+| mean recall | **68.04%** | — |
+| Total trainable params | 83M | 80-100M |
+| Training data | 591k image-caption pairs | similar |
+| Training compute | 10.8h on dual T4 (free Kaggle) | varies |
 
-### Hardware
-- NVIDIA GPU with 8GB+ VRAM (RTX 3060, 4060, etc.)
+Full numbers, methodology, and the bug-fix story (a contrastive collapse that destroyed an earlier run, plus how it was diagnosed and fixed) are in [RESULTS.md](RESULTS.md).
 
-### Software
-- Python 3.10+
-- PyTorch 2.0+
-- CUDA 11.8+
+## Retrieval examples
 
-## 🛠️ Installation
+![Retrieval examples](docs/retrieval_examples.png)
 
-```bash
-# Clone repository
-git clone https://github.com/mandarwagh9/vl-jepa-jetson.git
-cd vl-jepa-jetson
+Top half is text-to-image, bottom half is image-to-text, all queries running against the COCO 5K val gallery. Cosine similarity scores in the 0.51-0.59 range are the typical operating range of the aligned embedding space.
 
-# Create virtual environment
+## What's in here
+
+| Component | What it does |
+|---|---|
+| `vl_jepa/models/vl_jepa.py` | Main model: vision encoder, text encoder, predictor, EMA targets, all three forward modes (jepa / contrastive / both), SigLIP and InfoNCE losses, autograd-aware all-gather for DDP |
+| `vl_jepa/models/vision_encoder.py` | timm ViT-Tiny wrapper with separate `forward_context` path for I-JEPA-style masked encoding |
+| `vl_jepa/models/text_encoder.py` | DistilBERT wrapper (HuggingFace) |
+| `vl_jepa/models/predictor.py` | Transformer predictor with per-residual DropPath |
+| `vl_jepa/masks/multiblock.py` | I-JEPA multi-block mask sampler with fixed per-sample N_ctx / N_tgt for batched collation |
+| `train.py` | Training entrypoint, single-GPU and DDP, Stage-1 and Stage-2 modes |
+| `scripts/kaggle/train_kaggle.py` | Kaggle kernel entrypoint with auto torchrun launch on >= 2 GPUs |
+| `scripts/diagnose_checkpoint.py` | Forensic tool: load a checkpoint, inspect projection-head and encoder CLS for collapse |
+| `scripts/plot_training_curves.py` | Parse a training log, generate the loss + retrieval-recall PNG |
+| `scripts/generate_retrieval_examples.py` | Run image<->text retrieval on the val gallery, render a grid of examples |
+| `tests/` | 66 unit + smoke tests covering JEPA loss, masks, EMA schedule, retrieval metrics, DDP all-gather, SigLIP gradient survival, checkpoint round-trip, config consistency |
+
+## Architecture
+
+```
+VL-JEPA Model — 154.89M params (83.01M trainable)
+├── Vision Encoder: timm/vit_tiny_patch16_224 (5.7M)
+│     └── patch_size=16, 14x14=196 patches, hidden_dim=192, 12 layers
+├── Text Encoder: distilbert-base-uncased (66M)
+│     └── hidden_dim=768, max_length=128, learning rate x0.05 of base
+├── Predictor: 6-layer Transformer (1M)
+│     └── per-residual DropPath, sees full token grid + bidirectional attn
+├── Vision projection: LayerNorm + Linear(192 -> 256)
+├── Text projection:   LayerNorm + Linear(768 -> 256)
+├── SigLIP logit_scale, logit_bias (learnable scalars)
+└── EMA target encoders (deepcopy of vision + text, frozen, momentum 0.996 -> 1.0)
+```
+
+### Forward modes
+
+`VLJEPAModel.forward(..., mode=...)` accepts three values:
+
+- `"jepa"` — patch-prediction loss only. Vision encoder runs on context patches, target encoder runs on full image, predictor predicts targets, loss is masked smooth-L1 in latent space.
+- `"contrastive"` — vision-text alignment only. Both encoders produce CLS, projections map to shared 256-dim space, SigLIP (or InfoNCE) on the normalized embeddings.
+- `"both"` — single combined forward used by `train.py`. Reuses CLS from the online vision encoder for the contrastive head while the JEPA loss runs in parallel.
+
+## Quick start
+
+### 1. Setup
+
+```powershell
+git clone https://github.com/kartikshirode/vl-jepa.git
+cd vl-jepa
+
 python -m venv .venv
+.venv\Scripts\activate              # Windows PowerShell
+# source .venv/bin/activate         # Linux / macOS
 
-# Activate (pick the one for your OS)
-.venv\Scripts\activate         # Windows (PowerShell or cmd)
-source .venv/bin/activate      # Linux / macOS
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Optional: install dev tools (pytest, pytest-cov)
-pip install -e .[dev]
+pip install -e .[dev]               # optional: pytest etc.
 ```
 
-### Running tests
+### 2. Download COCO 2017
 
-```bash
-pytest tests/ -v
+```
+http://images.cocodataset.org/zips/train2017.zip
+http://images.cocodataset.org/zips/val2017.zip
+http://images.cocodataset.org/annotations/annotations_trainval2017.zip
 ```
 
-## 📊 Dataset Preparation
+Extract into `vl_jepa/data/COCO2017/` so the layout is:
 
-### COCO Captions
-
-1. Download from [COCO Dataset](https://cocodataset.org/#download):
-   - `train2017.zip` (~18GB)
-   - `val2017.zip` (~1GB)
-   - `annotations_trainval2017.zip` (~241MB)
-
-2. Extract to `./vl_jepa/data/COCO2017/`:
 ```
 vl_jepa/data/COCO2017/
-├── train2017/
-├── val2017/
+├── train2017/         # ~118k jpg files
+├── val2017/           # ~5k jpg files
 └── annotations/
     ├── captions_train2017.json
     └── captions_val2017.json
 ```
 
-## 🎯 Training
+### 3. Train
 
-### Start Training
-
-```bash
-# Start training with DGPU config
+```powershell
+# Local dGPU (RTX 4060 or similar):
 python train.py --config config_dgpu.yaml
 
-# Resume from checkpoint
-python train.py --config config_dgpu.yaml --resume checkpoints/checkpoint_epoch_5.pth
-
-# With Weights & Biases logging
-python train.py --config config_dgpu.yaml --wandb
+# Kaggle dual-T4 (run via the kernel; see scripts/kaggle/README.md):
+kaggle kernels push -p scripts/kaggle
 ```
 
-### Configuration
+The Kaggle entrypoint auto-detects multi-GPU and launches via `torchrun --nproc_per_node=N`, so the same config works on a single T4 or both. See [scripts/kaggle/README.md](scripts/kaggle/README.md) for the full operational guide.
 
-Edit `config_dgpu.yaml` to adjust:
-- **batch_size**: 16 (default, adjust based on VRAM)
-- **gradient_accumulation_steps**: 2 (effective batch = 32)
-- **learning_rate**: 3e-4
-- **num_epochs**: 100
-- **Loss weights**: `jepa_loss_weight: 1.0`, `contrastive_loss_weight: 0.5`
+### 4. Run inference
 
-### Training Metrics
-
-The training uses combined loss:
-```
-Total Loss = jepa_loss_weight × JEPA Loss + contrastive_loss_weight × Contrastive Loss
+```powershell
+python inference.py \
+    --config configs/config_kaggle_t4.yaml \
+    --checkpoint kaggle_outputs/checkpoints/checkpoint_epoch_9.pth \
+    --mode similarity \
+    --image path/to/img.jpg \
+    --text "a description of the image"
 ```
 
-- **JEPA Loss**: Smooth L1 loss between predicted and target patch representations
-- **Contrastive Loss**: InfoNCE loss for vision-language alignment
+### 5. Reproduce the result figures
 
-## 🧪 Model Architecture
+```powershell
+# Training curves from the log
+python scripts/plot_training_curves.py kaggle_outputs/logs/train_*.log
 
-```
-VL-JEPA Model (~145M parameters, ~73M trainable)
-├── Vision Encoder (ViT-Tiny)
-│   ├── Patch Embedding: 16x16 patches
-│   ├── Hidden Dim: 192
-│   ├── Layers: 12
-│   ├── Attention Heads: 3
-│   └── Parameters: ~5.7M
-├── Text Encoder (DistilBERT)
-│   ├── Hidden Dim: 768
-│   ├── Layers: 6
-│   ├── Max Length: 128 tokens
-│   └── Parameters: ~66M
-├── Predictor (MLP)
-│   ├── Hidden: 384
-│   ├── Layers: 4
-│   └── Parameters: ~1M
-├── Projection Heads
-│   └── Embedding Dim: 256
-└── Target Encoders (EMA, frozen)
-    └── Momentum: 0.996 → 1.0
+# Retrieval examples grid from the checkpoint + val gallery
+python scripts/generate_retrieval_examples.py \
+    --checkpoint kaggle_outputs/checkpoints/checkpoint_epoch_9.pth \
+    --config configs/config_kaggle_t4.yaml \
+    --data-root vl_jepa/data/COCO2017
 ```
 
-## 🎨 Masking Strategy
+### 6. Verify a checkpoint loads correctly
 
-JEPA-style multi-block masking:
-- **Context blocks**: 1 block (85-100% scale) - visible to model
-- **Target blocks**: 4 blocks (15-20% scale) - model predicts these
-- **Patch grid**: 14×14 = 196 patches
-
-## 📈 Evaluation Metrics
-
-- **Image→Text Retrieval**: R@1, R@5, R@10
-- **Text→Image Retrieval**: R@1, R@5, R@10  
-- **Mean Recall**: Average across all retrieval metrics
-- **Validation Loss**: Contrastive loss on validation set
-
-## 📁 Project Structure
-
-```
-vl-jepa/
-├── vl_jepa/                  # Main package
-│   ├── models/               # Model implementations
-│   │   ├── vision_encoder.py    # ViT encoder
-│   │   ├── text_encoder.py      # DistilBERT encoder
-│   │   ├── predictor.py         # MLP/Transformer predictor
-│   │   └── vl_jepa.py           # Main VL-JEPA model
-│   ├── data/                 # Data loading
-│   │   ├── dataset.py           # COCO dataset
-│   │   ├── transforms.py        # Image augmentations
-│   │   └── collate.py           # Batch collation
-│   ├── masks/                # Masking strategy
-│   │   └── multiblock.py        # Multi-block masks
-│   └── utils/                # Utilities
-│       ├── config.py            # Config management
-│       ├── logger.py            # Logging
-│       ├── checkpoint.py        # Checkpointing
-│       └── metrics.py           # Evaluation metrics
-├── scripts/                  # Utility scripts
-├── checkpoints/              # Model checkpoints
-├── train.py                  # Training script
-├── inference.py              # Inference script
-├── config_dgpu.yaml          # DGPU configuration
-└── requirements.txt          # Dependencies
+```powershell
+python scripts/diagnose_checkpoint.py \
+    kaggle_outputs/checkpoints/checkpoint_epoch_9.pth \
+    configs/config_kaggle_t4.yaml
 ```
 
-## 🔧 Troubleshooting
+## Two-stage training
 
-### Out of Memory
+`train.py --stage2` runs a second-stage retrieval fine-tune that freezes the text encoder, halves the learning rate, runs ~4 epochs of contrastive-only training, and early-stops on `mean_recall`. Useful if you want to squeeze a few more recall points out of an existing Stage-1 checkpoint.
 
-```yaml
-# Reduce batch size
-training:
-  batch_size: 8
-  gradient_accumulation_steps: 4  # Keep effective batch size
+```powershell
+python train.py --config config_dgpu.yaml \
+    --resume kaggle_outputs/checkpoints/checkpoint_epoch_9.pth \
+    --stage2
 ```
 
-### Slow Training
+## Tests
 
-- Check GPU utilization: `nvidia-smi`
-- Increase `num_workers` in config
-- Enable `pin_memory: true`
+```powershell
+python -m pytest tests/ -v
+```
 
-## 📚 References
+66 tests covering masking, JEPA loss, EMA schedule, retrieval metrics dedupe, checkpoint round-trip, DDP all-gather autograd behavior, SigLIP gradient survival on uniform similarity matrices, config consistency between the two YAML files, and several smoke tests for module imports and forward passes.
 
-- [VL-JEPA Paper](https://arxiv.org/abs/2512.10942v1)
-- [I-JEPA: A Path Towards Autonomous Machine Intelligence](https://arxiv.org/abs/2301.08243)
-- [COCO Dataset](https://cocodataset.org/)
+## Configurations
 
-## 📄 License
+Two configs ship in the repo:
 
-MIT License - see LICENSE file for details.
+| File | Target |
+|---|---|
+| `config_dgpu.yaml` | Local discrete-GPU runs (RTX 3060/4060, 8 GB+). Single GPU. |
+| `configs/config_kaggle_t4.yaml` | Kaggle "GPU T4 x2" kernel. Single or dual T4 via DDP. SigLIP + x0.05 text LR. |
+| `configs/config_coco_full.yaml` | Jetson-tuned variant (batch 1, gradient accumulation). |
+
+## References
+
+- [VL-JEPA paper (Chen et al., 2025)](https://arxiv.org/abs/2512.10942v1) — the source of the methodology and the `0.05x` text encoder LR (Table 5b).
+- [I-JEPA: A Path Towards Autonomous Machine Intelligence (Assran et al., 2023)](https://arxiv.org/abs/2301.08243) — the masked-patch prediction recipe.
+- [SigLIP: Sigmoid Loss for Language-Image Pretraining (Zhai et al., 2023)](https://arxiv.org/abs/2303.15343) — the contrastive loss that fixed the small-batch InfoNCE collapse.
+- [COCO Dataset](https://cocodataset.org/) — the pretraining corpus.
+
+## License
+
+MIT License - see [LICENSE](LICENSE).
