@@ -829,8 +829,15 @@ def main():
     # Load checkpoint if resuming
     start_epoch = 0
     global_step = 0
-    best_metric = float('inf') if not args.stage2 else 0.0  # Stage-2 uses mean_recall (higher is better)
-    best_mean_recall = 0.0  # Track best mean recall for Stage-2
+    # Both stages now use mean_recall (higher = better) as the selection metric.
+    # Stage-1 used to compare val_loss (lower = better), but under SigLIP the
+    # val_loss climbs as the model improves -- logit_scale/bias couple loss
+    # magnitude to the embedding distribution, and the per-rank eval-mode loss
+    # is computed without the all-gather, so it tracks a moving target. The
+    # v15 run's best_model.pth ended up being the epoch-0 weights because val
+    # loss only ever went up; switching the selection metric prevents this.
+    best_metric = 0.0
+    best_mean_recall = 0.0  # Track best mean recall for Stage-2 (legacy alias)
 
     if args.resume:
         # load_checkpoint calls model.load_state_dict; the state dict was
@@ -943,11 +950,16 @@ def main():
                     logger.info(f"Stage-2: Early stopping triggered (no improvement for {early_stop_patience} epochs)")
                     break
         else:
-            # Stage-1: val_loss (lower is better). When no val_loader, val_loss
-            # falls back to train_loss above, so progress still updates best.
-            is_best = val_metrics['val_loss'] < best_metric
+            # Stage-1: mean_recall (higher is better). Falls back to 0.0 when
+            # no val_loader (no_val branch above already constructed a dummy
+            # val_metrics with mean_recall=0.0 in that case, so is_best stays
+            # False after the first epoch -- the explicit save_every cadence
+            # below still writes per-epoch checkpoints regardless).
+            current_mean_recall = val_metrics.get('mean_recall', 0.0)
+            is_best = current_mean_recall > best_metric
             if is_best:
-                best_metric = val_metrics['val_loss']
+                best_metric = current_mean_recall
+                logger.info(f"Stage-1: New best mean_recall = {best_metric:.2f}%")
         
         # Save checkpoint. Only rank 0 writes to disk; other ranks block on
         # the barrier so they do not race ahead into the next epoch while
